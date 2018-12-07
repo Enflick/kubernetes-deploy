@@ -7,6 +7,10 @@ module KubernetesDeploy
       def fetch_user_auth_options(user)
         if user.dig('auth-provider', 'name') == 'gcp'
           { bearer_token: new_token }
+        elsif user.dig('exec')
+          args = [user.dig('exec', 'command')] + user.dig('exec','args')
+          out, err, st = Open3.capture3(*args)
+          { bearer_token: JSON.parse(out)['status']['token'] }
         else
           super
         end
