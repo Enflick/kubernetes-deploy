@@ -447,7 +447,8 @@ module KubernetesDeploy
       pruned = kubectl_output.scan(/^(.*) pruned$/)
       return unless pruned.present?
 
-      @logger.info("The following resources were pruned: #{pruned.join(', ')}")
+      str = ColorizedString.new("The following resources were pruned: #{pruned.join(', ')}").red
+      @logger.info(str)
       @logger.summary.add_action("pruned #{pruned.length} #{'resource'.pluralize(pruned.length)}")
     end
 
