@@ -75,13 +75,9 @@ This repo also includes related tools for [running tasks](#kubernetes-run) and [
 * Ruby 2.3+
 * Your cluster must be running Kubernetes v1.9.0 or higher<sup>1</sup>
 * Each app must have a deploy directory containing its Kubernetes templates (see [Templates](#using-templates-and-variables))
-* You must remove the` kubectl.kubernetes.io/last-applied-configuration` annotation from any resources in the namespace that are not included in your deploy directory. This annotation is added automatically when you create resources with `kubectl apply`. `kubernetes-deploy` will prune any resources that have this annotation and are not in the deploy directory.<sup>2</sup>
-* Each app managed by `kubernetes-deploy` must have its own exclusive Kubernetes namespace.
 
 <sup>1</sup> We run integration tests against these Kubernetes versions. You can find our
 offical compatibility chart below.
-
-<sup>2</sup> This requirement can be bypassed with the `--no-prune` option, but it is not recommended.
 
 | Kubernetes version | Last officially supported in gem version |
 | :----------------: | :-------------------: |
@@ -117,7 +113,7 @@ Refer to `kubernetes-deploy --help` for the authoritative set of options.
 
 - `--template-dir=DIR`: Used to set the deploy directory. Set `$ENVIRONMENT` instead to use `config/deploy/$ENVIRONMENT`.
 - `--bindings=BINDINGS`: Makes additional variables available to your ERB templates. For example, `kubernetes-deploy my-app cluster1 --bindings=color=blue,size=large` will expose `color` and `size`.
-- `--no-prune`: Skips pruning of resources that are no longer in your Kubernetes template set. Not recommended, as it allows your namespace to accumulate cruft that is not reflected in your deploy directory.
+- `--prune`: Prunes resources that are no longer in your Kubernetes template set.
 - `--max-watch-seconds=seconds`: Raise a timeout error if it takes longer than _seconds_ for any
 resource to deploy.
 

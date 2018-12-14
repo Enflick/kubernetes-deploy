@@ -8,10 +8,8 @@ module KubernetesDeploy
       end
 
       if !template_dir || template_dir.empty?
-        puts "Template directory is unknown. " \
-          "Either specify --template-dir argument or set $ENVIRONMENT to use config/deploy/$ENVIRONMENT " \
-        + "as a default path."
-        exit 1
+        template_dir = "."
+        puts "Using current directory as template directory"
       end
 
       template_dir
@@ -19,8 +17,8 @@ module KubernetesDeploy
 
     def self.revision_from_environment
       ENV.fetch('REVISION') do
-        puts "ENV['REVISION'] is missing. Please specify the commit SHA"
-        exit 1
+        puts "Using 1 as default Revision"
+        '1'
       end
     end
   end
