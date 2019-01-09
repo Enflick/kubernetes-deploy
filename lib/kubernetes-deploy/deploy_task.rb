@@ -109,7 +109,8 @@ module KubernetesDeploy
         current_sha: @current_sha,
         template_dir: @template_dir,
         logger: @logger,
-        bindings: bindings,
+        context: context,
+        bindings: bindings
       )
     end
 

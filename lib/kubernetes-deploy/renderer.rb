@@ -16,9 +16,10 @@ module KubernetesDeploy
     end
     class PartialNotFound < InvalidTemplateError; end
 
-    def initialize(current_sha:, template_dir:, logger:, bindings: {})
+    def initialize(current_sha:, template_dir:, logger:, context: "", bindings: {})
       @current_sha = current_sha
       @template_dir = template_dir
+      @context = context
       @partials_dirs =
         %w(partials ../partials).map { |d| File.expand_path(File.join(@template_dir, d)) }
       @logger = logger
@@ -76,6 +77,7 @@ module KubernetesDeploy
       {
         'current_sha' => @current_sha,
         'deployment_id' => @id,
+        'context' => @context,
       }.merge(@bindings)
     end
 

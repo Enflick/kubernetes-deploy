@@ -1,4 +1,21 @@
-# kubernetes-deploy [![Build status](https://badge.buildkite.com/d1aab6d17b010f418e43f740063fe5343c5d65df654e635a8b.svg?branch=master)](https://buildkite.com/shopify/kubernetes-deploy-gem) [![codecov](https://codecov.io/gh/Shopify/kubernetes-deploy/branch/master/graph/badge.svg)](https://codecov.io/gh/Shopify/kubernetes-deploy)
+# Custom Changes Documentation
+NB! This is a fork from official Shopify kubernetes-deploy gem with some drastical changes to support TextNow flow.
+This fork includes following breaking changes:
+* Default `--template-dir` is now current directory
+* `--no-prune` has been replaced with `--prune`, default run keeps all resources from accidental deletion
+* `REVISION` is defaulted to value of `1`
+* `context` is passed over to Rendered template through DeployTask with a default value of "" with a desire to access cluster name in templates
+
+The main reason behind given changes is our desire to follow different path of using given gem in-comparison to Shopify, mainly providing less command-line arguments
+and removing the possibility of accidentally wiping out the whole namespace by forgetting to provide `--no-prune` flag.
+
+For a guidance on installing the custom version, please visit our internal Kubernetes GitHub repository.
+
+------------------
+
+# Legacy Documentation / Original
+
+## kubernetes-deploy [![Build status](https://badge.buildkite.com/d1aab6d17b010f418e43f740063fe5343c5d65df654e635a8b.svg?branch=master)](https://buildkite.com/shopify/kubernetes-deploy-gem) [![codecov](https://codecov.io/gh/Shopify/kubernetes-deploy/branch/master/graph/badge.svg)](https://codecov.io/gh/Shopify/kubernetes-deploy)
 
 `kubernetes-deploy` is a command line tool that helps you ship changes to a Kubernetes namespace and understand the result. At Shopify, we use it within our much-beloved, open-source [Shipit](https://github.com/Shopify/shipit-engine#kubernetes) deployment app.
 
