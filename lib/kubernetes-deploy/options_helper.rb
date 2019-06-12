@@ -9,7 +9,7 @@ module KubernetesDeploy
 
       if !template_dir || template_dir.empty?
         template_dir = "."
-        puts "Using current directory as template directory"
+        puts "-- [info] Using current directory as template directory"
       end
 
       template_dir
@@ -17,7 +17,7 @@ module KubernetesDeploy
 
     def self.revision_from_environment
       ENV.fetch('REVISION') do
-        puts "Using 1 as default Revision"
+        puts "-- [info] Using 1 as default Revision"
         '1'
       end
     end
