@@ -38,7 +38,7 @@ module KubernetesDeploy
 
         unless template_dir
           template_dir = "."
-          puts "Using current directory as template directory"
+          puts "# Using current directory as template directory"
         end
         unless Dir.exist?(template_dir)
           raise OptionsError, "Template directory #{template_dir} does not exist."
