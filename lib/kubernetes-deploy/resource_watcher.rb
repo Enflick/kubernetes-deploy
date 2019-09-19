@@ -1,10 +1,14 @@
 # frozen_string_literal: true
+
+require 'kubernetes-deploy/concurrency'
+require 'kubernetes-deploy/resource_cache'
+
 module KubernetesDeploy
   class ResourceWatcher
     extend KubernetesDeploy::StatsD::MeasureMethods
 
     def initialize(resources:, logger:, context:, namespace:,
-      deploy_started_at: Time.now.utc, operation_name: "deploy", timeout: nil)
+      deploy_started_at: Time.now.utc, operation_name: "deploy", timeout: nil, sha: nil)
       unless resources.is_a?(Enumerable)
         raise ArgumentError, <<~MSG
           ResourceWatcher expects Enumerable collection, got `#{resources.class}` instead
@@ -17,6 +21,7 @@ module KubernetesDeploy
       @deploy_started_at = deploy_started_at
       @operation_name = operation_name
       @timeout = timeout
+      @sha = sha
     end
 
     def run(delay_sync: 3.seconds, reminder_interval: 30.seconds, record_summary: true)
@@ -53,6 +58,14 @@ module KubernetesDeploy
       resources.each(&:after_sync)
     end
     measure_method(:sync_resources, "sync.duration")
+
+    def statsd_tags
+      {
+        namespace: @namespace,
+        context: @context,
+        sha: @sha,
+      }
+    end
 
     def global_timeout?(started_at)
       @timeout && (Time.now.utc - started_at > @timeout)

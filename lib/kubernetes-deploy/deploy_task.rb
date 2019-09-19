@@ -1,19 +1,22 @@
 # frozen_string_literal: true
-require 'open3'
 require 'yaml'
 require 'shellwords'
 require 'tempfile'
 require 'fileutils'
+
+require 'kubernetes-deploy/common'
+require 'kubernetes-deploy/concurrency'
+require 'kubernetes-deploy/resource_cache'
 require 'kubernetes-deploy/kubernetes_resource'
 %w(
+  custom_resource
   cloudsql
   config_map
   deployment
   ingress
   persistent_volume_claim
   pod
-  redis
-  memcached
+  network_policy
   service
   pod_template
   pod_disruption_budget
@@ -21,15 +24,12 @@ require 'kubernetes-deploy/kubernetes_resource'
   service_account
   daemon_set
   resource_quota
-  elasticsearch
-  statefulservice
-  topic
-  bucket
   stateful_set
   cron_job
   job
   custom_resource_definition
   horizontal_pod_autoscaler
+  secret
 ).each do |subresource|
   require "kubernetes-deploy/kubernetes_resource/#{subresource}"
 end
@@ -39,25 +39,11 @@ require 'kubernetes-deploy/kubeclient_builder'
 require 'kubernetes-deploy/ejson_secret_provisioner'
 require 'kubernetes-deploy/renderer'
 require 'kubernetes-deploy/cluster_resource_discovery'
-require 'kubernetes-deploy/template_discovery'
+require 'kubernetes-deploy/template_sets'
 
 module KubernetesDeploy
   class DeployTask
-    include KubeclientBuilder
     extend KubernetesDeploy::StatsD::MeasureMethods
-
-    PREDEPLOY_SEQUENCE = %w(
-      ResourceQuota
-      Cloudsql
-      Redis
-      Memcached
-      ConfigMap
-      PersistentVolumeClaim
-      ServiceAccount
-      Role
-      RoleBinding
-      Pod
-    )
 
     PROTECTED_NAMESPACES = %w(
       default
@@ -70,8 +56,24 @@ module KubernetesDeploy
     # core/v1/Endpoints -- managed by services
     # core/v1/PersistentVolumeClaim -- would delete data
     # core/v1/ReplicationController -- superseded by deployments/replicasets
-    # extensions/v1beta1/ReplicaSet -- managed by deployments
-    # core/v1/Secret -- should not committed / managed by shipit
+
+    def predeploy_sequence
+      before_crs = %w(
+        ResourceQuota
+        NetworkPolicy
+      )
+      after_crs = %w(
+        ConfigMap
+        PersistentVolumeClaim
+        ServiceAccount
+        Role
+        RoleBinding
+        Secret
+        Pod
+      )
+
+      before_crs + cluster_resource_discoverer.crds.select(&:predeployed?).map(&:kind) + after_crs
+    end
 
     def prune_whitelist
       wl = %w(
@@ -79,14 +81,21 @@ module KubernetesDeploy
         core/v1/Pod
         core/v1/Service
         core/v1/ResourceQuota
+        core/v1/Secret
+        core/v1/ServiceAccount
+        core/v1/PodTemplate
         batch/v1/Job
+        extensions/v1beta1/ReplicaSet
         extensions/v1beta1/DaemonSet
         extensions/v1beta1/Deployment
         extensions/v1beta1/Ingress
+        networking.k8s.io/v1/NetworkPolicy
         apps/v1beta1/StatefulSet
         autoscaling/v1/HorizontalPodAutoscaler
         policy/v1beta1/PodDisruptionBudget
         batch/v1beta1/CronJob
+        rbac.authorization.k8s.io/v1/Role
+        rbac.authorization.k8s.io/v1/RoleBinding
       )
       wl + cluster_resource_discoverer.crds.select(&:prunable?).map(&:group_version_kind)
     end
@@ -95,23 +104,22 @@ module KubernetesDeploy
       kubectl.server_version
     end
 
-    def initialize(namespace:, context:, current_sha:, template_dir:, logger:, kubectl_instance: nil, bindings: {},
-      max_watch_seconds: nil)
+    def initialize(namespace:, context:, current_sha:, logger: nil, kubectl_instance: nil, bindings: {},
+      max_watch_seconds: nil, selector: nil, template_paths: [], template_dir: nil)
+      template_dir = File.expand_path(template_dir) if template_dir
+      template_paths = (template_paths.map { |path| File.expand_path(path) } << template_dir).compact
+
+      @logger = logger || KubernetesDeploy::FormattedLogger.build(namespace, context)
+      @template_sets = TemplateSets.from_dirs_and_files(paths: template_paths, logger: @logger)
+      @task_config = KubernetesDeploy::TaskConfig.new(context, namespace, @logger)
+      @bindings = bindings
       @namespace = namespace
       @namespace_tags = []
       @context = context
       @current_sha = current_sha
-      @template_dir = File.expand_path(template_dir)
-      @logger = logger
       @kubectl = kubectl_instance
       @max_watch_seconds = max_watch_seconds
-      @renderer = KubernetesDeploy::Renderer.new(
-        current_sha: @current_sha,
-        template_dir: @template_dir,
-        logger: @logger,
-        context: context,
-        bindings: bindings
-      )
+      @selector = selector
     end
 
     def run(*args)
@@ -132,7 +140,6 @@ module KubernetesDeploy
 
       @logger.phase_heading("Checking initial resource statuses")
       check_initial_status(resources)
-      create_ejson_secrets(prune)
 
       if deploy_has_priority_resources?(resources)
         @logger.phase_heading("Predeploying priority resources")
@@ -185,6 +192,10 @@ module KubernetesDeploy
 
     private
 
+    def kubeclient_builder
+      @kubeclient_builder ||= KubeclientBuilder.new
+    end
+
     def cluster_resource_discoverer
       @cluster_resource_discoverer ||= ClusterResourceDiscovery.new(
         namespace: @namespace,
@@ -194,12 +205,31 @@ module KubernetesDeploy
       )
     end
 
+    def ejson_provisioners
+      @ejson_provisoners ||= @template_sets.ejson_secrets_files.map do |ejson_secret_file|
+        EjsonSecretProvisioner.new(
+          namespace: @namespace,
+          context: @context,
+          ejson_keys_secret: ejson_keys_secret,
+          ejson_file: ejson_secret_file,
+          logger: @logger,
+          statsd_tags: @namespace_tags,
+          selector: @selector,
+        )
+      end
+    end
+
     def deploy_has_priority_resources?(resources)
-      resources.any? { |r| PREDEPLOY_SEQUENCE.include?(r.type) }
+      resources.any? { |r| predeploy_sequence.include?(r.type) }
     end
 
     def predeploy_priority_resources(resource_list)
-      PREDEPLOY_SEQUENCE.each do |resource_type|
+      bare_pods = resource_list.select { |resource| resource.is_a?(Pod) }
+      if bare_pods.count == 1
+        bare_pods.first.stream_logs = true
+      end
+
+      predeploy_sequence.each do |resource_type|
         matching_resources = resource_list.select { |r| r.type == resource_type }
         next if matching_resources.empty?
         deploy_resources(matching_resources, verify: true, record_summary: false)
@@ -219,12 +249,19 @@ module KubernetesDeploy
     measure_method(:predeploy_priority_resources, 'priority_resources.duration')
 
     def validate_resources(resources)
-      KubernetesDeploy::Concurrency.split_across_threads(resources) { |r| r.validate_definition(kubectl) }
+      KubernetesDeploy::Concurrency.split_across_threads(resources) do |r|
+        r.validate_definition(kubectl, selector: @selector)
+      end
+
+      resources.select(&:has_warnings?).each do |resource|
+        record_warnings(warning: resource.validation_warning_msg, filename: File.basename(resource.file_path))
+      end
+
       failed_resources = resources.select(&:validation_failed?)
       return unless failed_resources.present?
 
       failed_resources.each do |r|
-        content = File.read(r.file_path) if File.file?(r.file_path)
+        content = File.read(r.file_path) if File.file?(r.file_path) && !r.sensitive_template_content?
         record_invalid_template(err: r.validation_error_msg, filename: File.basename(r.file_path), content: content)
       end
       raise FatalDeploymentError, "Template validation failed"
@@ -238,95 +275,62 @@ module KubernetesDeploy
     end
     measure_method(:check_initial_status, "initial_status.duration")
 
-    def create_ejson_secrets(prune)
-      ejson = EjsonSecretProvisioner.new(
-        namespace: @namespace,
-        context: @context,
-        template_dir: @template_dir,
-        logger: @logger,
-        prune: prune,
-      )
-      return unless ejson.secret_changes_required?
-
-      @logger.phase_heading("Deploying kubernetes secrets from #{EjsonSecretProvisioner::EJSON_SECRETS_FILE}")
-      ejson.run
+    def secrets_from_ejson
+      ejson_provisioners.flat_map(&:resources)
     end
-    measure_method(:create_ejson_secrets)
 
     def discover_resources
+      @logger.info("Discovering resources:")
       resources = []
-      @logger.info("Discovering templates:")
-
-      TemplateDiscovery.new(@template_dir).templates.each do |filename|
-        split_templates(filename) do |r_def|
-          r = KubernetesResource.build(namespace: @namespace, context: @context, logger: @logger,
-                                       definition: r_def, statsd_tags: @namespace_tags)
-          resources << r
-          @logger.info "  - #{r.id}"
-        end
+      crds_by_kind = cluster_resource_discoverer.crds.group_by(&:kind)
+      @template_sets.with_resource_definitions(render_erb: true,
+          current_sha: @current_sha, bindings: @bindings) do |r_def|
+        crd = crds_by_kind[r_def["kind"]]&.first
+        r = KubernetesResource.build(namespace: @namespace, context: @context, logger: @logger, definition: r_def,
+          statsd_tags: @namespace_tags, crd: crd)
+        resources << r
+        @logger.info("  - #{r.id}")
       end
+
+      secrets_from_ejson.each do |secret|
+        resources << secret
+        @logger.info("  - #{secret.id} (from ejson)")
+      end
+
       if (global = resources.select(&:global?).presence)
         @logger.warn("Detected non-namespaced #{'resource'.pluralize(global.count)} which will never be pruned:")
         global.each { |r| @logger.warn("  - #{r.id}") }
       end
-      resources
+      resources.sort
+    rescue InvalidTemplateError => e
+      record_invalid_template(err: e.message, filename: e.filename, content: e.content)
+      raise FatalDeploymentError, "Failed to render and parse template"
     end
     measure_method(:discover_resources)
 
-    def split_templates(filename)
-      file_content = File.read(File.join(@template_dir, filename))
-      rendered_content = @renderer.render_template(filename, file_content)
-      YAML.load_stream(rendered_content, "<rendered> #{filename}") do |doc|
-        next if doc.blank?
-        unless doc.is_a?(Hash)
-          raise InvalidTemplateError.new("Template is not a valid Kubernetes manifest",
-            filename: filename, content: doc)
-        end
-        yield doc
-      end
-    rescue InvalidTemplateError => e
-      e.filename ||= filename
-      record_invalid_template(err: e.message, filename: e.filename, content: e.content)
-      raise FatalDeploymentError, "Failed to render and parse template"
-    rescue Psych::SyntaxError => e
-      record_invalid_template(err: e.message, filename: filename, content: rendered_content)
-      raise FatalDeploymentError, "Failed to render and parse template"
-    end
-
-    def record_invalid_template(err:, filename:, content:)
+    def record_invalid_template(err:, filename:, content: nil)
       debug_msg = ColorizedString.new("Invalid template: #{filename}\n").red
-      debug_msg += "> Error message:\n#{indent_four(err)}"
-      debug_msg += "\n> Template content:\n#{indent_four(content)}"
+      debug_msg += "> Error message:\n#{FormattedLogger.indent_four(err)}"
+      if content
+        debug_msg += if content =~ /kind:\s*Secret/
+          "\n> Template content: Suppressed because it may contain a Secret"
+        else
+          "\n> Template content:\n#{FormattedLogger.indent_four(content)}"
+        end
+      end
       @logger.summary.add_paragraph(debug_msg)
     end
 
-    def indent_four(str)
-      "    " + str.gsub("\n", "\n    ")
+    def record_warnings(warning:, filename:)
+      warn_msg = "Template warning: #{filename}\n"
+      warn_msg += "> Warning message:\n#{FormattedLogger.indent_four(warning)}"
+      @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
     end
 
     def validate_configuration(allow_protected_ns:, prune:)
       errors = []
-      if ENV["KUBECONFIG"].blank?
-        errors << "$KUBECONFIG not set"
-      elsif config_files.empty?
-        errors << "Kube config file name(s) not set in $KUBECONFIG"
-      else
-        config_files.each do |f|
-          unless File.file?(f)
-            errors << "Kube config not found at #{f}"
-          end
-        end
-      end
-
-      if @current_sha.blank?
-        errors << "Current SHA must be specified"
-      end
-
-      if !File.directory?(@template_dir)
-        errors << "Template directory `#{@template_dir}` doesn't exist"
-      elsif Dir.entries(@template_dir).none? { |file| file =~ /\.ya?ml(\.erb)?$/ }
-        errors << "`#{@template_dir}` doesn't contain valid templates (postfix .yml or .yml.erb)"
-      end
+      errors += kubeclient_builder.validate_config_files
+      errors += @template_sets.validate
 
       if @namespace.blank?
         errors << "Namespace must be specified"
@@ -354,6 +358,8 @@ module KubernetesDeploy
 
       confirm_context_exists
       confirm_namespace_exists
+      confirm_ejson_keys_not_prunable if prune
+      @logger.info("Using resource selector #{@selector}") if @selector
       @namespace_tags |= tags_from_namespace_labels
       @logger.info("All required parameters and files are present")
     end
@@ -365,6 +371,9 @@ module KubernetesDeploy
 
       if resources.length > 1
         @logger.info("Deploying resources:")
+        resources.each do |r|
+          @logger.info("- #{r.id} (#{r.pretty_timeout_type})")
+        end
       else
         resource = resources.first
         @logger.info("Deploying #{resource.id} (#{resource.pretty_timeout_type})")
@@ -377,7 +386,6 @@ module KubernetesDeploy
       applyables += individuals.select { |r| pruneable_types.include?(r.type) }
 
       individuals.each do |r|
-        @logger.info("- #{r.id} (#{r.pretty_timeout_type})") if resources.length > 1
         r.deploy_started_at = Time.now.utc
         case r.deploy_method
         when :replace
@@ -405,7 +413,7 @@ module KubernetesDeploy
 
       if verify
         watcher = ResourceWatcher.new(resources: resources, logger: @logger, deploy_started_at: deploy_started_at,
-          timeout: @max_watch_seconds, namespace: @namespace, context: @context)
+          timeout: @max_watch_seconds, namespace: @namespace, context: @context, sha: @current_sha)
         watcher.run(record_summary: record_summary)
       end
     end
@@ -421,23 +429,28 @@ module KubernetesDeploy
 
       Dir.mktmpdir do |tmp_dir|
         resources.each do |r|
-          @logger.info("- #{r.id} (#{r.pretty_timeout_type})") if resources.length > 1
           FileUtils.symlink(r.file_path, tmp_dir)
           r.deploy_started_at = Time.now.utc
         end
         command.push("-f", tmp_dir)
 
         if prune
-          command.push("--prune", "--all")
+          command.push("--prune")
+          if @selector
+            command.push("--selector", @selector.to_s)
+          else
+            command.push("--all")
+          end
           prune_whitelist.each { |type| command.push("--prune-whitelist=#{type}") }
         end
 
-        out, err, st = kubectl.run(*command, log_failure: false)
+        output_is_sensitive = resources.any?(&:sensitive_template_content?)
+        out, err, st = kubectl.run(*command, log_failure: false, output_is_sensitive: output_is_sensitive)
 
         if st.success?
           log_pruning(out) if prune
         else
-          record_apply_failure(err)
+          record_apply_failure(err, resources: resources)
           raise FatalDeploymentError, "Command failed: #{Shellwords.join(command)}"
         end
       end
@@ -453,24 +466,40 @@ module KubernetesDeploy
       @logger.summary.add_action("pruned #{pruned.length} #{'resource'.pluralize(pruned.length)}")
     end
 
-    def record_apply_failure(err)
+    def record_apply_failure(err, resources: [])
       warn_msg = "WARNING: Any resources not mentioned in the error(s) below were likely created/updated. " \
         "You may wish to roll back this deploy."
       @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
 
       unidentified_errors = []
+      filenames_with_sensitive_content = resources
+        .select(&:sensitive_template_content?)
+        .map { |r| File.basename(r.file_path) }
+
       err.each_line do |line|
         bad_files = find_bad_files_from_kubectl_output(line)
         if bad_files.present?
-          bad_files.each { |f| record_invalid_template(err: f[:err], filename: f[:filename], content: f[:content]) }
+          bad_files.each do |f|
+            if filenames_with_sensitive_content.include?(f[:filename])
+              # Hide the error and template contents in case it has senitive information
+              record_invalid_template(err: "SUPPRESSED FOR SECURITY", filename: f[:filename], content: nil)
+            else
+              record_invalid_template(err: f[:err], filename: f[:filename], content: f[:content])
+            end
+          end
         else
           unidentified_errors << line
         end
       end
 
-      if unidentified_errors.present?
-        msg = "#{ColorizedString.new('Unidentified error(s):').red}\n#{indent_four(unidentified_errors.join)}"
-        @logger.summary.add_paragraph(msg)
+      if unidentified_errors.present? && filenames_with_sensitive_content.any?
+        warn_msg = "WARNING: There was an error applying some or all resources. The raw output may be sensitive and " \
+          "so cannot be displayed."
+        @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
+      elsif unidentified_errors.present?
+        heading = ColorizedString.new('Unidentified error(s):').red
+        msg = FormattedLogger.indent_four(unidentified_errors.join)
+        @logger.summary.add_paragraph("#{heading}\n#{msg}")
       end
     end
 
@@ -511,35 +540,54 @@ module KubernetesDeploy
         end
       end
       raise FatalDeploymentError, "Failed to reach server for #{@context}" unless success
-      if kubectl.server_version < Gem::Version.new(MIN_KUBE_VERSION)
-        @logger.warn(KubernetesDeploy::Errors.server_version_warning(server_version))
-      end
+      TaskConfigValidator.new(@task_config, kubectl, kubeclient_builder, only: [:validate_server_version]).valid?
     end
 
     def confirm_namespace_exists
-      st, err = nil
-      with_retries(2) do
-        _, err, st = kubectl.run("get", "namespace", @namespace, use_namespace: false, log_failure: true)
-        st.success? || err.include?(KubernetesDeploy::Kubectl::NOT_FOUND_ERROR_TEXT)
-      end
-      raise FatalDeploymentError, "Failed to find namespace. #{err}" unless st.success?
+      raise FatalDeploymentError, "Namespace #{@namespace} not found" unless namespace_definition.present?
       @logger.info("Namespace #{@namespace} found")
     end
 
-    def tags_from_namespace_labels
-      namespace_info = nil
-      with_retries(2) do
-        namespace_info, _, st = kubectl.run("get", "namespace", @namespace, "-o", "json", use_namespace: false,
-          log_failure: true)
-        st.success?
+    def namespace_definition
+      @namespace_definition ||= begin
+        definition, _err, st = kubectl.run("get", "namespace", @namespace, use_namespace: false,
+          log_failure: true, raise_if_not_found: true, attempts: 3, output: 'json')
+        st.success? ? JSON.parse(definition, symbolize_names: true) : nil
       end
-      return [] if namespace_info.blank?
-      namespace_labels = JSON.parse(namespace_info, symbolize_names: true).fetch(:metadata, {}).fetch(:labels, {})
+    rescue Kubectl::ResourceNotFoundError
+      nil
+    end
+
+    # make sure to never prune the ejson-keys secret
+    def confirm_ejson_keys_not_prunable
+      return unless ejson_keys_secret.dig("metadata", "annotations", KubernetesResource::LAST_APPLIED_ANNOTATION)
+
+      @logger.error("Deploy cannot proceed because protected resource " \
+        "Secret/#{EjsonSecretProvisioner::EJSON_KEYS_SECRET} would be pruned.")
+      raise EjsonPrunableError
+    rescue Kubectl::ResourceNotFoundError => e
+      @logger.debug("Secret/#{EjsonSecretProvisioner::EJSON_KEYS_SECRET} does not exist: #{e}")
+    end
+
+    def tags_from_namespace_labels
+      return [] if namespace_definition.blank?
+      namespace_labels = namespace_definition.fetch(:metadata, {}).fetch(:labels, {})
       namespace_labels.map { |key, value| "#{key}:#{value}" }
     end
 
     def kubectl
       @kubectl ||= Kubectl.new(namespace: @namespace, context: @context, logger: @logger, log_failure_by_default: true)
+    end
+
+    def ejson_keys_secret
+      @ejson_keys_secret ||= begin
+        out, err, st = kubectl.run("get", "secret", EjsonSecretProvisioner::EJSON_KEYS_SECRET, output: "json",
+          raise_if_not_found: true, attempts: 3, output_is_sensitive: true, log_failure: true)
+        unless st.success?
+          raise EjsonSecretError, "Error retrieving Secret/#{EjsonSecretProvisioner::EJSON_KEYS_SECRET}: #{err}"
+        end
+        JSON.parse(out)
+      end
     end
 
     def statsd_tags

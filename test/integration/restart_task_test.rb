@@ -6,8 +6,8 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
   def test_restart_by_annotation
     assert_deploy_success(deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "web.yml.erb", "redis.yml"]))
 
-    refute fetch_restarted_at("web"), "no RESTARTED_AT env on fresh deployment"
-    refute fetch_restarted_at("redis"), "no RESTARTED_AT env on fresh deployment"
+    refute(fetch_restarted_at("web"), "no RESTARTED_AT env on fresh deployment")
+    refute(fetch_restarted_at("redis"), "no RESTARTED_AT env on fresh deployment")
 
     restart = build_restart_task
     assert_restart_success(restart.perform)
@@ -19,12 +19,42 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
       %r{Successfully restarted in \d+\.\d+s: Deployment/web},
       "Result: SUCCESS",
       "Successfully restarted 1 resource",
-      %r{Deployment/web.*1 availableReplica}
+      %r{Deployment/web.*1 availableReplica},
     ],
       in_order: true)
 
-    assert fetch_restarted_at("web"), "RESTARTED_AT is present after the restart"
-    refute fetch_restarted_at("redis"), "no RESTARTED_AT env on fresh deployment"
+    assert(fetch_restarted_at("web"), "RESTARTED_AT is present after the restart")
+    refute(fetch_restarted_at("redis"), "no RESTARTED_AT env on fresh deployment")
+  end
+
+  def test_restart_by_selector
+    assert_deploy_success(deploy_fixtures("branched",
+      bindings: { "branch" => "master" },
+      selector: KubernetesDeploy::LabelSelector.parse("branch=master")))
+    assert_deploy_success(deploy_fixtures("branched",
+      bindings: { "branch" => "staging" },
+      selector: KubernetesDeploy::LabelSelector.parse("branch=staging")))
+
+    refute(fetch_restarted_at("master-web"), "no RESTARTED_AT env on fresh deployment")
+    refute(fetch_restarted_at("staging-web"), "no RESTARTED_AT env on fresh deployment")
+
+    restart = build_restart_task
+    assert_restart_success(restart.perform(selector: KubernetesDeploy::LabelSelector.parse("name=web,branch=staging")))
+
+    assert_logs_match_all([
+      "Configured to restart all deployments with the `shipit.shopify.io/restart` annotation " \
+      "and name=web,branch=staging selector",
+      "Triggered `staging-web` restart",
+      "Waiting for rollout",
+      %r{Successfully restarted in \d+\.\ds: Deployment/staging-web},
+      "Result: SUCCESS",
+      "Successfully restarted 1 resource",
+      %r{Deployment/staging-web.*1 availableReplica},
+    ],
+      in_order: true)
+
+    assert(fetch_restarted_at("staging-web"), "RESTARTED_AT is present after the restart")
+    refute(fetch_restarted_at("master-web"), "no RESTARTED_AT env on fresh deployment")
   end
 
   def test_restart_by_annotation_none_found
@@ -33,7 +63,7 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
     assert_logs_match_all([
       "Configured to restart all deployments with the `shipit.shopify.io/restart` annotation",
       "Result: FAILURE",
-      %r{No deployments with the `shipit\.shopify\.io/restart` annotation found in namespace}
+      %r{No deployments with the `shipit\.shopify\.io/restart` annotation found in namespace},
     ],
       in_order: true)
   end
@@ -41,7 +71,7 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
   def test_restart_named_deployments_twice
     assert_deploy_success(deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "web.yml.erb"]))
 
-    refute fetch_restarted_at("web"), "no RESTARTED_AT env on fresh deployment"
+    refute(fetch_restarted_at("web"), "no RESTARTED_AT env on fresh deployment")
 
     restart = build_restart_task
     assert_restart_success(restart.perform(%w(web)))
@@ -53,26 +83,26 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
       %r{Successfully restarted in \d+\.\d+s: Deployment/web},
       "Result: SUCCESS",
       "Successfully restarted 1 resource",
-      %r{Deployment/web.*1 availableReplica}
+      %r{Deployment/web.*1 availableReplica},
     ],
       in_order: true)
 
     first_restarted_at = fetch_restarted_at("web")
-    assert first_restarted_at, "RESTARTED_AT is present after first restart"
+    assert(first_restarted_at, "RESTARTED_AT is present after first restart")
 
     Timecop.freeze(1.second.from_now) do
       assert_restart_success(restart.perform(%w(web)))
     end
 
     second_restarted_at = fetch_restarted_at("web")
-    assert second_restarted_at, "RESTARTED_AT is present after second restart"
-    refute_equal first_restarted_at.value, second_restarted_at.value
+    assert(second_restarted_at, "RESTARTED_AT is present after second restart")
+    refute_equal(first_restarted_at.value, second_restarted_at.value)
   end
 
   def test_restart_with_same_resource_twice
     assert_deploy_success(deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "web.yml.erb"]))
 
-    refute fetch_restarted_at("web"), "no RESTARTED_AT env on fresh deployment"
+    refute(fetch_restarted_at("web"), "no RESTARTED_AT env on fresh deployment")
 
     restart = build_restart_task
     assert_restart_success(restart.perform(%w(web web)))
@@ -82,11 +112,11 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
       "Triggered `web` restart",
       "Result: SUCCESS",
       "Successfully restarted 1 resource",
-      %r{Deployment/web.*1 availableReplica}
+      %r{Deployment/web.*1 availableReplica},
     ],
       in_order: true)
 
-    assert fetch_restarted_at("web"), "RESTARTED_AT is present after the restart"
+    assert(fetch_restarted_at("web"), "RESTARTED_AT is present after the restart")
   end
 
   def test_restart_not_existing_deployment
@@ -95,22 +125,22 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
     assert_logs_match_all([
       "Configured to restart deployments by name: web",
       "Result: FAILURE",
-      "Deployment `web` not found in namespace"
+      "Deployment `web` not found in namespace",
     ],
       in_order: true)
   end
 
   def test_restart_one_not_existing_deployment
-    assert deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "web.yml.erb"])
+    assert(deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "web.yml.erb"]))
 
     restart = build_restart_task
     assert_restart_failure(restart.perform(%w(walrus web)))
 
-    refute fetch_restarted_at("web"), "no RESTARTED_AT env after failed restart task"
+    refute(fetch_restarted_at("web"), "no RESTARTED_AT env after failed restart task")
     assert_logs_match_all([
       "Configured to restart deployments by name: walrus, web",
       "Result: FAILURE",
-      "Deployment `walrus` not found in namespace"
+      "Deployment `walrus` not found in namespace",
     ],
       in_order: true)
   end
@@ -120,7 +150,17 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
     assert_restart_failure(restart.perform([]))
     assert_logs_match_all([
       "Result: FAILURE",
-      "Configured to restart deployments by name, but list of names was blank"
+      "Configured to restart deployments by name, but list of names was blank",
+    ],
+      in_order: true)
+  end
+
+  def test_restart_deployments_and_selector
+    restart = build_restart_task
+    assert_restart_failure(restart.perform(%w(web), selector: KubernetesDeploy::LabelSelector.parse("app=web")))
+    assert_logs_match_all([
+      "Result: FAILURE",
+      "Can't specify deployment names and selector at the same time",
     ],
       in_order: true)
   end
@@ -134,7 +174,7 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
     assert_restart_failure(restart.perform(%w(web)))
     assert_logs_match_all([
       "Result: FAILURE",
-      "`walrus` context must be configured in your kubeconfig file(s)"
+      /- Context walrus missing from your kubeconfig file\(s\)/,
     ],
       in_order: true)
   end
@@ -148,7 +188,7 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
     assert_restart_failure(restart.perform(%w(web)))
     assert_logs_match_all([
       "Result: FAILURE",
-      "Namespace `walrus` not found in context `#{TEST_CONTEXT}`"
+      "- Could not find Namespace: walrus in Context: #{KubeclientHelper::TEST_CONTEXT}",
     ],
       in_order: true)
   end
@@ -166,9 +206,9 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
           "command" => [
             "/bin/sh",
             "-c",
-            "test $(env | grep -s RESTARTED_AT -c) -eq 0"
-          ]
-        }
+            "test $(env | grep -s RESTARTED_AT -c) -eq 0",
+          ],
+        },
       }
     end
     assert_deploy_success(success)
@@ -185,7 +225,7 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
       "The following containers have not passed their readiness probes",
       "app must exit 0 from the following command",
       "Final status: 2 replicas, 1 updatedReplica, 1 availableReplica, 1 unavailableReplica",
-      "Unhealthy: Readiness probe failed"
+      "Unhealthy: Readiness probe failed",
     ],
       in_order: true)
   end
@@ -197,7 +237,7 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
       container = web["spec"]["template"]["spec"]["containers"].first
       container["readinessProbe"] = {
         "exec" => { "command" => %w(sleep 5) },
-        "timeoutSeconds" => 6
+        "timeoutSeconds" => 6,
       }
     end
     assert_deploy_success(result)
@@ -209,15 +249,78 @@ class RestartTaskTest < KubernetesDeploy::IntegrationTest
     new_pods = pods.select do |pod|
       pod.spec.containers.any? { |c| c["name"] == "app" && c.env&.find { |n| n.name == "RESTARTED_AT" } }
     end
-    assert new_pods.length >= 1, "Expected at least one new pod, saw #{new_pods.length}"
+    assert(new_pods.length >= 1, "Expected at least one new pod, saw #{new_pods.length}")
 
     new_ready_pods = new_pods.select do |pod|
       pod.status.phase == "Running" &&
       pod.status.conditions.any? { |condition| condition["type"] == "Ready" && condition["status"] == "True" }
     end
-    assert_equal 1, new_ready_pods.length, "Expected exactly one new pod to be ready, saw #{new_ready_pods.length}"
+    assert_equal(1, new_ready_pods.length, "Expected exactly one new pod to be ready, saw #{new_ready_pods.length}")
 
-    assert fetch_restarted_at("web"), "RESTARTED_AT is present after the restart"
+    assert(fetch_restarted_at("web"), "RESTARTED_AT is present after the restart")
+  end
+
+  def test_verify_result_false_succeeds
+    assert_deploy_success(deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "web.yml.erb", "redis.yml"]))
+
+    refute(fetch_restarted_at("web"), "no RESTARTED_AT env on fresh deployment")
+    refute(fetch_restarted_at("redis"), "no RESTARTED_AT env on fresh deployment")
+
+    restart = build_restart_task
+    assert_restart_success(restart.perform(verify_result: false))
+
+    assert_logs_match_all([
+      "Configured to restart all deployments with the `shipit.shopify.io/restart` annotation",
+      "Triggered `web` restart",
+      "Result: SUCCESS",
+      "Result verification is disabled for this task",
+    ],
+      in_order: true)
+
+    assert(fetch_restarted_at("web"), "RESTARTED_AT is present after the restart")
+    refute(fetch_restarted_at("redis"), "no RESTARTED_AT env on fresh deployment")
+  end
+
+  def test_verify_result_false_fails_on_config_checks
+    restart = build_restart_task
+    assert_restart_failure(restart.perform(verify_result: false))
+    assert_logs_match_all([
+      "Configured to restart all deployments with the `shipit.shopify.io/restart` annotation",
+      "Result: FAILURE",
+      %r{No deployments with the `shipit\.shopify\.io/restart` annotation found in namespace},
+    ],
+      in_order: true)
+  end
+
+  def test_verify_result_false_succeeds_quickly_when_verification_would_timeout
+    success = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "web.yml.erb"]) do |fixtures|
+      deployment = fixtures["web.yml.erb"]["Deployment"].first
+      deployment["spec"]["progressDeadlineSeconds"] = 30
+      container = deployment["spec"]["template"]["spec"]["containers"].first
+      container["readinessProbe"] = {
+        "failureThreshold" => 1,
+        "periodSeconds" => 1,
+        "initialDelaySeconds" => 0,
+        "exec" => {
+          "command" => [
+            "/bin/sh",
+            "-c",
+            "test $(env | grep -s RESTARTED_AT -c) -eq 0",
+          ],
+        },
+      }
+    end
+    assert_deploy_success(success)
+
+    restart = build_restart_task
+    restart.perform!(%w(web), verify_result: false)
+
+    assert_logs_match_all([
+      "Triggered `web` restart",
+      "Result: SUCCESS",
+      "Result verification is disabled for this task",
+    ],
+      in_order: true)
   end
 
   private

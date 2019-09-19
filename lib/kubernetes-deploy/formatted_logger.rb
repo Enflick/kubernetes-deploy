@@ -1,10 +1,15 @@
 # frozen_string_literal: true
 require 'logger'
+require 'colorized_string'
 require 'kubernetes-deploy/deferred_summary_logging'
 
 module KubernetesDeploy
   class FormattedLogger < Logger
     include DeferredSummaryLogging
+
+    def self.indent_four(str)
+      "    " + str.to_s.gsub("\n", "\n    ")
+    end
 
     def self.build(namespace = nil, context = nil, stream = $stderr, verbose_prefix: false)
       l = new(stream)
@@ -19,8 +24,6 @@ module KubernetesDeploy
         end
 
         "[#{context}][#{namespace}]"
-      else
-        ""
       end
 
       l.formatter = proc do |severity, datetime, _progname, msg|

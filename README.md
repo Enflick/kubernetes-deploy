@@ -13,9 +13,11 @@ For a guidance on installing the custom version, please visit our internal Kuber
 
 ------------------
 
-# Legacy Documentation / Original
+# krane
 
-## kubernetes-deploy [![Build status](https://badge.buildkite.com/d1aab6d17b010f418e43f740063fe5343c5d65df654e635a8b.svg?branch=master)](https://buildkite.com/shopify/kubernetes-deploy-gem) [![codecov](https://codecov.io/gh/Shopify/kubernetes-deploy/branch/master/graph/badge.svg)](https://codecov.io/gh/Shopify/kubernetes-deploy)
+As this project approaches the v1.0 milestone, we're excited to announce that `kubernetes-deploy` will be [officially renamed as `krane`](https://github.com/Shopify/kubernetes-deploy/issues/30#issuecomment-468750341). Follow the [1.0 requirement label](https://github.com/Shopify/kubernetes-deploy/issues?q=is%3Aissue+is%3Aopen+label%3A%22%3Arocket%3A+1.0+requirement%22) to keep up with the progress.
+
+# kubernetes-deploy [![Build status](https://badge.buildkite.com/61937e40a1fc69754d9d198be120543d6de310de2ba8d3cb0e.svg?branch=master)](https://buildkite.com/shopify/kubernetes-deploy) [![codecov](https://codecov.io/gh/Shopify/kubernetes-deploy/branch/master/graph/badge.svg)](https://codecov.io/gh/Shopify/kubernetes-deploy)
 
 `kubernetes-deploy` is a command line tool that helps you ship changes to a Kubernetes namespace and understand the result. At Shopify, we use it within our much-beloved, open-source [Shipit](https://github.com/Shopify/shipit-engine#kubernetes) deployment app.
 
@@ -59,6 +61,7 @@ This repo also includes related tools for [running tasks](#kubernetes-run) and [
   * [Customizing behaviour with annotations](#customizing-behaviour-with-annotations)
   * [Running tasks at the beginning of a deploy](#running-tasks-at-the-beginning-of-a-deploy)
   * [Deploying Kubernetes secrets (from EJSON)](#deploying-kubernetes-secrets-from-ejson)
+  * [Deploying custom resources](#deploying-custom-resources)
 
 **KUBERNETES-RESTART**
 * [Usage](#usage-1)
@@ -70,12 +73,6 @@ This repo also includes related tools for [running tasks](#kubernetes-run) and [
 **KUBERNETES-RENDER**
 * [Prerequisites](#prerequisites-2)
 * [Usage](#usage-3)
-
-**DEVELOPMENT**
-* [Setup](#setup)
-* [Running the test suite locally](#running-the-test-suite-locally)
-* [Releasing a new version (Shopify employees)](#releasing-a-new-version-shopify-employees)
-* [CI (External contributors)](#ci-external-contributors)
 
 **CONTRIBUTING**
 * [Contributing](#contributing)
@@ -90,11 +87,11 @@ This repo also includes related tools for [running tasks](#kubernetes-run) and [
 ## Prerequisites
 
 * Ruby 2.3+
-* Your cluster must be running Kubernetes v1.9.0 or higher<sup>1</sup>
+* Your cluster must be running Kubernetes v1.11.0 or higher<sup>1</sup>
 * Each app must have a deploy directory containing its Kubernetes templates (see [Templates](#using-templates-and-variables))
 
 <sup>1</sup> We run integration tests against these Kubernetes versions. You can find our
-offical compatibility chart below.
+official compatibility chart below.
 
 | Kubernetes version | Last officially supported in gem version |
 | :----------------: | :-------------------: |
@@ -102,10 +99,12 @@ offical compatibility chart below.
 |        1.6         |        0.15.2         |
 |        1.7         |        0.20.6         |
 |        1.8         |        0.21.1         |
+|        1.9         |        0.24.0         |
+|        1.10        |        0.27.0         |
 
 ## Installation
 
-1. [Install kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/#install-kubectl-binary-via-curl) (requires v1.9.0 or higher) and make sure it is available in your $PATH
+1. [Install kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/#install-kubectl-binary-via-curl) (requires v1.11.0 or higher) and make sure it is available in your $PATH
 2. Set up your [kubeconfig file](https://kubernetes.io/docs/tasks/access-application-cluster/authenticate-across-clusters-kubeconfig/) for access to your cluster(s).
 3. `gem install kubernetes-deploy`
 
@@ -118,8 +117,9 @@ offical compatibility chart below.
 
 *Environment variables:*
 
-- `$REVISION` **(required)**: the SHA of the commit you are deploying. Will be exposed to your ERB templates as `current_sha`.
-- `$KUBECONFIG`  **(required)**: points to one or multiple valid kubeconfig files that include the context you want to deploy to. File names are separated by colon for Linux and Mac, and semi-colon for Windows.
+- `$REVISION`: the SHA of the commit you are deploying. Will be exposed to your ERB templates as `current_sha`.
+- `$KUBECONFIG`: points to one or multiple valid kubeconfig files that include the context you want to deploy to. File names are separated by colon for Linux and Mac, and semi-colon for Windows. If ommitted, will use the Kubernetes default of `~/.kube/config`.
+- `$TASK_ID`: used as the ID of the deployment for resource naming.
 - `$ENVIRONMENT`: used to set the deploy directory to `config/deploy/$ENVIRONMENT`. You can use the `--template-dir=DIR` option instead if you prefer (**one or the other is required**).
 - `$GOOGLE_APPLICATION_CREDENTIALS`: points to the credentials for an authenticated service account (required if your kubeconfig `user`'s auth provider is GCP)
 
@@ -128,12 +128,23 @@ offical compatibility chart below.
 
 Refer to `kubernetes-deploy --help` for the authoritative set of options.
 
-- `--template-dir=DIR`: Used to set the deploy directory. Set `$ENVIRONMENT` instead to use `config/deploy/$ENVIRONMENT`.
+- `--template-dir=DIR`: Used to set the deploy directory. Set `$ENVIRONMENT` instead to use `config/deploy/$ENVIRONMENT`. This flag also supports reading from STDIN. You can do this by using `--template-dir=-`. Example: `cat templates_from_stdin/*.yml | kubernetes-deploy ns ctx --template-dir=-`.
+- (alpha feature) `-f [PATHS]`: Accepts a comma-separated list of directories and/or filenames to specify the set of directories/files that will be deployed (use `-` to read from STDIN). Can be invoked multiple times. Cannot be combined with `--template-dir`. Example: `cat templates_from_stdin/*.yml | kubernetes-deploy ns ctx -f -,path/to/dir,path/to/file.yml`
 - `--bindings=BINDINGS`: Makes additional variables available to your ERB templates. For example, `kubernetes-deploy my-app cluster1 --bindings=color=blue,size=large` will expose `color` and `size`.
 - `--prune`: Prunes resources that are no longer in your Kubernetes template set.
 - `--max-watch-seconds=seconds`: Raise a timeout error if it takes longer than _seconds_ for any
 resource to deploy.
+- `--selector`: Instructs kubernetes-deploy to only prune resources which match the specified label selector, such as `environment=staging`. If you use this option, all resource templates must specify matching labels. See [Sharing a namespace](#sharing-a-namespace) below.
 
+> **NOTICE**: Deploy Secret resources at your own risk. Although we will fix any reported leak vectors with urgency, we cannot guarantee that sensitive information will never be logged.
+
+### Sharing a namespace
+
+By default, kubernetes-deploy will prune any resources in the target namespace which have the `kubectl.kubernetes.io/last-applied-configuration` annotation and are not a result of the current deployment process, on the assumption that there is a one-to-one relationship between application deployment and namespace, and that a deployment provisions all relevant resources in the namespace.
+
+If you need to, you may specify `--no-prune` to disable all pruning behaviour, but this is not recommended.
+
+If you need to share a namespace with resources which are managed by other tools or indeed other kubernetes-deploy deployments, you can supply the `--selector` option, such that only resources with labels matching the selector are considered for pruning.
 
 ### Using templates and variables
 
@@ -142,7 +153,7 @@ Each app's templates are expected to be stored in a single directory. If this is
 All templates must be YAML formatted. You can also use ERB. The following local variables will be available to your ERB templates by default:
 
 * `current_sha`: The value of `$REVISION`
-* `deployment_id`:  A randomly generated identifier for the deploy. Useful for creating unique names for task-runner pods (e.g. a pod that runs rails migrations at the beginning of deploys).
+* `deployment_id`: The value of `$TASK_ID`, or in its absence, a randomly generated identifier for the deploy. Useful for creating unique names for task-runner pods (e.g. a pod that runs rails migrations at the beginning of deploys).
 
 You can add additional variables using the `--bindings=BINDINGS` option which can be formated as comma separated string, JSON string or path to a JSON or YAML file. Complex JSON or YAML data will be converted to a Hash for use in templates. To load a file the argument should include the relative file path prefixed with an `@` sign. An argument error will be raised if the string argument cannot be parsed, the referenced file does not include a valid extension (`.json`, `.yaml` or `.yml`) or the referenced file does not exist.
 
@@ -237,10 +248,10 @@ This is a limitation of the current implementation.
 
 
 ### Customizing behaviour with annotations
-- `kubernetes-deploy.shopify.io/timeout-override`: Override the tool's hard timeout for one specific resource. Both full ISO8601 durations and the time portion of ISO8601 durations are valid. Value must be between 1 second and 24 hours.
+- `krane.shopify.io/timeout-override`: Override the tool's hard timeout for one specific resource. Both full ISO8601 durations and the time portion of ISO8601 durations are valid. Value must be between 1 second and 24 hours.
   - _Example values_: 45s / 3m / 1h / PT0.25H
-  - _Compatibility_: all resource types (Note: `Deployment` timeouts are based on `spec.progressDeadlineSeconds` if present, and that field has a default value as of the `apps/v1beta1` group version. Using this annotation will have no effect on `Deployment`s that time out with "Timeout reason: ProgressDeadlineExceeded".)
-- `kubernetes-deploy.shopify.io/required-rollout`: Modifies how much of the rollout needs to finish
+  - _Compatibility_: all resource types
+- `krane.shopify.io/required-rollout`: Modifies how much of the rollout needs to finish
 before the deployment is considered successful.
   - _Compatibility_: Deployment
   - `full`: The deployment is successful when all pods in the new `replicaSet` are ready.
@@ -251,10 +262,15 @@ before the deployment is considered successful.
   that use the `RollingUpdate` strategy.
   - Percent (e.g. 90%): The deploy is successful when the number of new pods that are ready is equal to
   `spec.replicas` * Percent.
-- `kubernetes-deploy.shopify.io/prunable`: Allows a Custom Resource to be pruned during deployment.
+- `krane.shopify.io/prunable`: Allows a Custom Resource to be pruned during deployment.
   - _Compatibility_: Custom Resource Definition
   - `true`: The custom resource will be pruned if the resource is not in the deploy directory.
   - All other values: The custom resource will not be pruned.
+- `krane.shopify.io/predeployed`: Causes a Custom Resource to be deployed in the pre-deploy phase.
+  - _Compatibility_: Custom Resource Definition
+  - _Default_: `true`
+  - `true`: The custom resource will be deployed in the pre-deploy phase.
+  - All other values: The custom resource will be deployed in the main deployment phase.
 
 ### Running tasks at the beginning of a deploy
 
@@ -268,7 +284,7 @@ To run a task in your cluster at the beginning of every deploy, simply include a
 
 A simple example can be found in the test fixtures: test/fixtures/hello-cloud/unmanaged-pod.yml.erb.
 
-The logs of all pods run in this way will be printed inline.
+The logs of all pods run in this way will be printed inline. If there is only one pod, the logs will be streamed in real-time. If there are multiple, they will be fetched when the pod terminates.
 
 ![migrate-logs](screenshots/migrate-logs.png)
 
@@ -283,6 +299,7 @@ Since their data is only base64 encoded, Kubernetes secrets should not be commit
 1. Install the ejson gem: `gem install ejson`
 2. Generate a new keypair: `ejson keygen` (prints the keypair to stdout)
 3. Create a Kubernetes secret in your target namespace with the new keypair: `kubectl create secret generic ejson-keys --from-literal=YOUR_PUBLIC_KEY=YOUR_PRIVATE_KEY --namespace=TARGET_NAMESPACE`
+>Warning: Do *not* use `apply` to create the `ejson-keys` secret. kubernetes-deploy will fail if `ejson-keys` is prunable. This safeguard is to protect against the accidental deletion of your private keys.
 4. (optional but highly recommended) Back up the keypair somewhere secure, such as a password manager, for disaster recovery purposes.
 5. In your template directory (alongside your Kubernetes templates), create `secrets.ejson` with the format shown below. The `_type` key should have the value “kubernetes.io/tls” for TLS secrets and “Opaque” for all others. The `data` key must be a json object, but its keys and values can be whatever you need.
 
@@ -311,6 +328,7 @@ Since their data is only base64 encoded, Kubernetes secrets should not be commit
 7. Commit the encrypted file and deploy as usual. The deploy will create secrets from the data in the `kubernetes_secrets` key.
 
 **Note**: Since leading underscores in ejson keys are used to skip encryption of the associated value, `kubernetes-deploy` will strip these leading underscores when it creates the keys for the Kubernetes secret data. For example, given the ejson data below, the `monitoring-token` secret will have keys `api-token` and `property` (_not_ `_property`):
+
 ```json
 {
   "_public_key": "YOUR_PUBLIC_KEY",
@@ -325,7 +343,97 @@ Since their data is only base64 encoded, Kubernetes secrets should not be commit
   }
 ```
 
+**A warning about using EJSON secrets with `--selector`**: when using EJSON to generate `Secret` resources and specifying a `--selector` for deployment, the labels from the selector are automatically added to the `Secret`. If _the same_ EJSON file is deployed to the same namespace using different selectors, this will cause the resource to thrash - even if the contents of the secret were the same, the resource has different labels on each deploy.
 
+### Deploying custom resources
+
+By default, kubernetes-deploy does not check the status of custom resources; it simply assumes that they deployed successfully. In order to meaningfully monitor the rollout of custom resources, kubernetes-deploy supports configuring pass/fail conditions using annotations on CustomResourceDefinitions (CRDs).
+
+>Note:
+This feature is only available on clusters running Kubernetes 1.11+ since it relies on the `metadata.generation` field being updated when custom resource specs are changed.
+
+*Requirements:*
+
+* The custom resource must expose a `status` subresource with an `observedGeneration` field.
+* The `krane.shopify.io/instance-rollout-conditions` annotation must be present on the CRD that defines the custom resource.
+* (optional) The `krane.shopify.io/instance-timeout` annotation can be added to the CRD that defines the custom resource to override the global default timeout for all instances of that resource. This annotation can use ISO8601 format or unprefixed ISO8601 time components (e.g. '1H', '60S').
+
+#### Specifying pass/fail conditions
+
+The presence of a valid `krane.shopify.io/instance-rollout-conditions` annotation on a CRD will cause kubernetes-deploy to monitor the rollout of all instances of that custom resource. Its value can either be `"true"` (giving you the defaults described in the next section) or a valid JSON string with the following format:
+```
+'{
+  "success_conditions": [
+    { "path": <JsonPath expression>, "value": <target value> }
+    ... more success conditions
+  ],
+  "failure_conditions": [
+    { "path": <JsonPath expression>, "value": <target value> }
+    ... more failure conditions
+  ]
+}'
+```
+
+For all conditions, `path` must be a valid JsonPath expression that points to a field in the custom resource's status. `value` is the value that must be present at `path` in order to fulfill a condition. For a deployment to be successful, _all_ `success_conditions` must be fulfilled. Conversely, the deploy will be marked as failed if _any one of_ `failure_conditions` is fulfilled. `success_conditions` are mandatory, but `failure_conditions` can be omitted (the resource will simply time out if it never reaches a successful state).
+
+In addition to `path` and `value`, a failure condition can also contain `error_msg_path` or `custom_error_msg`. `error_msg_path` is a JsonPath expression that points to a field you want to surface when a failure condition is fulfilled. For example, a status condition may expose a `message` field that contains a description of the problem it encountered. `custom_error_msg` is a string that can be used if your custom resource doesn't contain sufficient information to warrant using `error_msg_path`. Note that `custom_error_msg` has higher precedence than `error_msg_path` so it will be used in favor of `error_msg_path` when both fields are present.
+
+**Warning:**
+
+You **must** ensure that your custom resource controller sets `.status.observedGeneration` to match the observed `.metadata.generation` of the monitored resource once its sync is complete. If this does not happen, kubernetes-deploy will not check success or failure conditions and the deploy will time out.
+
+#### Example
+
+As an example, the following is the default configuration that will be used if you set `krane.shopify.io/instance-rollout-conditions: "true"` on the CRD that defines the custom resources you wish to monitor:
+
+```
+'{
+  "success_conditions": [
+    {
+      "path": "$.status.conditions[?(@.type == \"Ready\")].status",
+      "value": "True",
+    },
+  ],
+  "failure_conditions": [
+    {
+      "path": '$.status.conditions[?(@.type == \"Failed\")].status',
+      "value": "True",
+      "error_msg_path": '$.status.conditions[?(@.type == \"Failed\")].message',
+    },
+  ],
+}'
+```
+
+The paths defined here are based on the [typical status properties](https://github.com/kubernetes/community/blob/master/contributors/devel/api-conventions.md#typical-status-properties) as defined by the Kubernetes community. It expects the `status` subresource to contain a `conditions` array whose entries minimally specify `type`, `status`, and `message` fields.
+
+You can see how these conditions relate to the following resource:
+
+```
+apiVersion: stable.shopify.io/v1
+kind: Example
+metadata:
+  generation: 2
+  name: example
+  namespace: namespace
+spec:
+  ...
+status:
+  observedGeneration: 2
+  conditions:
+  - type: "Ready"
+    status: "False"
+    reason: "exampleNotReady"
+    message: "resource is not ready"
+  - type: "Failed"
+    status: "True"
+    reason: "exampleFailed"
+    message: "resource is failed"
+```
+
+- `observedGeneration == metadata.generation`, so kubernetes-deploy will check this resource's success and failure conditions.
+- Since `$.status.conditions[?(@.type == "Ready")].status == "False"`, the resource is not considered successful yet.
+- `$.status.conditions[?(@.type == "Failed")].status == "True"` means that a failure condition has been fulfilled and the resource is considered failed.
+- Since `error_msg_path` is specified, kubernetes-deploy will log the contents of `$.status.conditions[?(@.type == "Failed")].message`, which in this case is: `resource is failed`.
 
 # kubernetes-restart
 
@@ -359,6 +467,13 @@ With this done, you can use the following command to restart all of them:
 
 `kubernetes-restart <kube namespace> <kube context>`
 
+*Options:*
+
+Refer to `kubernetes-restart --help` for the authoritative set of options.
+
+- `--selector`: Only restarts Deployments which match the specified Kubernetes resource selector.
+- `--deployments`: Restart specific Deployment resources by name.
+
 # kubernetes-run
 
 `kubernetes-run` is a tool for triggering a one-off job, such as a rake task, _outside_ of a deploy.
@@ -367,7 +482,7 @@ With this done, you can use the following command to restart all of them:
 
 ## Prerequisites
 
-* You've already deployed a [`PodTemplate`](https://kubernetes.io/docs/api-reference/v1.9/#podtemplate-v1-core) object with field `template` containing a `Pod` specification that does not include the `apiVersion` or `kind` parameters. An example is provided in this repo in `test/fixtures/hello-cloud/template-runner.yml`.
+* You've already deployed a [`PodTemplate`](https://v1-10.docs.kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podtemplate-v1-core) object with field `template` containing a `Pod` specification that does not include the `apiVersion` or `kind` parameters. An example is provided in this repo in `test/fixtures/hello-cloud/template-runner.yml`.
 * The `Pod` specification in that template has a container named `task-runner`.
 
 Based on this specification `kubernetes-run` will create a new pod with the entrypoint of the `task-runner ` container overridden with the supplied arguments.
@@ -412,104 +527,25 @@ To render some templates in a template dir, run kubernetes-render with the names
 kubernetes-render --template-dir=./path/to/template/dir this-template.yaml.erb that-template.yaml.erb
 ```
 
+To render a template in a template dir and output it to a file, run kubernetes-render with the name of the template and redirect the output to a file:
+
+```
+kubernetes-render --template-dir=./path/to/template/dir template.yaml.erb > template.yaml
+```
+
 *Options:*
 
-- `--template-dir=DIR`: Used to set the directory to interpret template names relative to. This is often the same directory passed as `--template-dir` when running `kubernetes-deploy` to actually deploy templates. Set `$ENVIRONMENT` instead to use `config/deploy/$ENVIRONMENT`.
+- `--template-dir=DIR`: Used to set the directory to interpret template names relative to. This is often the same directory passed as `--template-dir` when running `kubernetes-deploy` to actually deploy templates. Set `$ENVIRONMENT` instead to use `config/deploy/$ENVIRONMENT`. This flag also supports reading from STDIN. You can do this by using `--template-dir=-`.
 - `--bindings=BINDINGS`: Makes additional variables available to your ERB templates. For example, `kubernetes-render --bindings=color=blue,size=large some-template.yaml.erb` will expose `color` and `size` to `some-template.yaml.erb`.
 
 
-# Development
-
-## Setup
-
-If you work for Shopify, just run `dev up`, but otherwise:
-
-1. [Install kubectl version 1.9.0 or higher](https://kubernetes.io/docs/user-guide/prereqs/) and make sure it is in your path
-2. [Install minikube](https://kubernetes.io/docs/getting-started-guides/minikube/#installation) (required to run the test suite)
-3. Check out the repo
-4. Run `bin/setup` to install dependencies
-
-To install this gem onto your local machine, run `bundle exec rake install`.
-
-
-
-## Running the test suite locally
-
-Using minikube:
-
-1. Start [minikube](https://kubernetes.io/docs/getting-started-guides/minikube/#installation) (`minikube start [options]`).
-2. Make sure you have a context named "minikube" in your kubeconfig. Minikube adds this context for you when you run `minikube start`. You can check for it using `kubectl config get-contexts`.
-3. Run `bundle exec rake test` (or `dev test` if you work for Shopify).
-
-Using another local cluster:
-
-1. Start your cluster.
-2. Put the name of the context you want to use in a file named `.local-context` in the root of this project. For example: `echo "dind" > .local-context`.
-3. Run `bundle exec rake test` (or `dev test` if you work for Shopify).
-
-To make StatsD log what it would have emitted, run a test with `STATSD_DEV=1`.
-
-To see the full-color output of a specific integration test, you can use `PRINT_LOGS=1`. For example: `PRINT_LOGS=1 bundle exec ruby -I test test/integration/kubernetes_deploy_test.rb -n/test_name/`.
-
-
-
-
-![test-output](screenshots/test-output.png)
-
-
-
-## Releasing a new version (Shopify employees)
-
-1. Make sure all merged PRs are reflected in the changelog before creating the commit for the new version.
-2. Update the version number in `version.rb` and commit that change with message "Version x.y.z". Don't push yet or you'll confuse Shipit.
-3. Tag the version with `git tag vx.y.z -a -m "Version x.y.z"`
-4. Push both your bump commit and its tag simultaneously with `git push origin master --follow-tags` (note that you can set `git config --global push.followTags true` to turn this flag on by default)
-5. Use the [Shipit Stack](https://shipit.shopify.io/shopify/kubernetes-deploy/rubygems) to build the `.gem` file and upload to [rubygems.org](https://rubygems.org/gems/kubernetes-deploy).
-
-If you push your commit and the tag separately, Shipit usually fails with `You need to create the v0.7.9 tag first.`. To make it find your tag, go to `Settings` > `Resynchronize this stack` > `Clear git cache`.
-
-
-## CI (External contributors)
-
-Please make sure you run the tests locally before submitting your PR (see [Running the test suite locally](#running-the-test-suite-locally)). After reviewing your PR, a Shopify employee will trigger CI for you.
-
-#### Employees: Triggering CI for a contributed PR
-
-Go to the [kubernetes-deploy-gem pipeline](https://buildkite.com/shopify/kubernetes-deploy-gem) and click "New Build". Use branch `external_contrib_ci` and the specific sha of the commit you want to build. Add `BUILDKITE_REFSPEC="refs/pull/${PR_NUM}/head"` in the Environment Variables section.
-
-<img width="350" alt="build external contrib PR" src="https://screenshot.click/2017-11-07--163728_7ovek-wrpwq.png">
-
 # Contributing
 
-Bug reports and pull requests are welcome on GitHub at https://github.com/Shopify/kubernetes-deploy.
+We :heart: contributors! To make it easier for you and us we've written a
+[Contributing Guide](https://github.com/Shopify/kubernetes-deploy/blob/master/CONTRIBUTING.md)
 
-Contributions to help us support additional resource types or increase the sophistication of our success heuristics for an existing type are especially encouraged! (See tips below)
 
-## Feature acceptance guidelines
-
-- This project's mission is to make it easy to ship changes to a Kubernetes namespace and understand the result. Features that introduce new classes of responsibility to the tool are not usually accepted.
-  - Deploys can be a very tempting place to cram features. Imagine a proposed feature actually fits better elsewhere—where might that be? (Examples: validator in CI, custom controller, initializer, pre-processing step in the CD pipeline, or even Kubernetes core)
-  - The basic ERB renderer included with the tool is intended as a convenience feature for a better out-of-the box experience. Providing complex rendering capabilities is out of scope of this project's mission, and enhancements in this area may be rejected.
-  - The deploy command does not officially support non-namespaced resource types.
-- This project strives to be composable with other tools in the ecosystem, such as renderers and validators. The deploy command must work with any Kubernetes templates provided to it, no matter how they were generated.
-- This project is open-source. Features tied to any specific organization (including Shopify) will be rejected.
-- The deploy command must remain performant when given several hundred resources at a time, generating 1000+ pods. (Technical note: This means only `sync` methods can make calls to the Kuberentes API server during result verification. This both limits the number of API calls made and ensures a consistent view of the world within each polling cycle.)
-- This tool must be able to run concurrent deploys to different targets safely, including when used as a library.
-
-## Contributing a new resource type
-
-The list of fully supported types is effectively the list of classes found in `lib/kubernetes-deploy/kubernetes_resource/`.
-
-This gem uses subclasses of `KubernetesResource` to implement custom success/failure detection logic for each resource type. If no subclass exists for a type you're deploying, the gem simply assumes `kubectl apply` succeeded (and prints a warning about this assumption). We're always looking to support more types! Here are the basic steps for contributing a new one:
-
-1. Create a the file for your type in `lib/kubernetes-deploy/kubernetes_resource/`
-2. Create a new class that inherits from `KubernetesResource`. Minimally, it should implement the following methods:
-    * `sync` -- Gather the data you'll need to determine `deploy_succeeded?` and `deploy_failed?`. The superclass's implementation fetches the corresponding resource, parses it and stores it in `@instance_data`. You can define your own implementation if you need something else.
-    * `deploy_succeeded?`
-    * `deploy_failed?`
-3. Adjust the `TIMEOUT` constant to an appropriate value for this type.
-4. Add the a basic example of the type to the hello-cloud [fixture set](https://github.com/Shopify/kubernetes-deploy/tree/master/test/fixtures/hello-cloud) and appropriate assertions to `#assert_all_up` in [`hello_cloud.rb`](https://github.com/Shopify/kubernetes-deploy/blob/master/test/helpers/fixture_sets/hello_cloud.rb). This will get you coverage in several existing tests, such as `test_full_hello_cloud_set_deploy_succeeds`.
-5. Add tests for any edge cases you foresee.
+You can also reach out to us on our slack channel, #krane, at https://kubernetes.slack.com. All are welcome!
 
 ## Code of Conduct
 Everyone is expected to follow our [Code of Conduct](https://github.com/Shopify/kubernetes-deploy/blob/master/CODE_OF_CONDUCT.md).

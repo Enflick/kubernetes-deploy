@@ -9,6 +9,8 @@ module KubernetesDeploy
       Preempting
     )
 
+    attr_accessor :stream_logs
+
     def initialize(namespace:, context:, definition:, logger:,
       statsd_tags: nil, parent: nil, deploy_started_at: nil, stream_logs: false)
       @parent = parent
@@ -63,10 +65,15 @@ module KubernetesDeploy
     end
 
     def timeout_message
-      return STANDARD_TIMEOUT_MESSAGE unless readiness_probe_failure?
-      probe_failure_msgs = @containers.map(&:readiness_fail_reason).compact
-      header = "The following containers have not passed their readiness probes on at least one pod:\n"
-      header + probe_failure_msgs.join("\n")
+      if readiness_probe_failure?
+        probe_failure_msgs = @containers.map(&:readiness_fail_reason).compact
+        header = "The following containers have not passed their readiness probes on at least one pod:\n"
+        header + probe_failure_msgs.join("\n")
+      elsif failed_schedule_reason.present?
+        "Pod could not be scheduled because #{failed_schedule_reason}"
+      else
+        STANDARD_TIMEOUT_MESSAGE
+      end
     end
 
     def failure_message
@@ -95,6 +102,16 @@ module KubernetesDeploy
     end
 
     private
+
+    def failed_schedule_reason
+      if phase == "Pending"
+        conditions = @instance_data.dig('status', 'conditions') || []
+        unschedulable = conditions.find do |condition|
+          condition["type"] == "PodScheduled" && condition["status"] == "False"
+        end
+        unschedulable&.dig('message')
+      end
+    end
 
     def failed_phase?
       phase == FAILED_PHASE_NAME
@@ -144,7 +161,7 @@ module KubernetesDeploy
     end
 
     def ready?
-      return false unless status_data = @instance_data["status"]
+      return false unless (status_data = @instance_data["status"])
       ready_condition = status_data.fetch("conditions", []).find { |condition| condition["type"] == "Ready" }
       ready_condition.present? && (ready_condition["status"] == "True")
     end
@@ -208,8 +225,7 @@ module KubernetesDeploy
         elsif limbo_reason == "CrashLoopBackOff"
           exit_code = @status.dig('lastState', 'terminated', 'exitCode')
           "Crashing repeatedly (exit #{exit_code}). See logs for more information."
-        elsif %w(ImagePullBackOff ErrImagePull).include?(limbo_reason) &&
-          limbo_message.match(/(?:not found)|(?:back-off)/i)
+        elsif limbo_reason == "ErrImagePull" && limbo_message.match(/not found/i)
           "Failed to pull image #{@image}. "\
           "Did you wait for it to be built and pushed to the registry before deploying?"
         elsif limbo_reason == "CreateContainerConfigError"

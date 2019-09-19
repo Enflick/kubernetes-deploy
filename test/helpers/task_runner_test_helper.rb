@@ -14,8 +14,8 @@ module TaskRunnerTestHelper
     reset_logger
   end
 
-  def build_task_runner(ns: @namespace, max_watch_seconds: nil)
-    KubernetesDeploy::RunnerTask.new(context: KubeclientHelper::TEST_CONTEXT, namespace: ns, logger: logger,
+  def build_task_runner(context: KubeclientHelper::TEST_CONTEXT, ns: @namespace, max_watch_seconds: nil)
+    KubernetesDeploy::RunnerTask.new(context: context, namespace: ns, logger: logger,
       max_watch_seconds: max_watch_seconds)
   end
 
@@ -29,9 +29,9 @@ module TaskRunnerTestHelper
           "echo \"Line $i\"; " \
           "sleep #{log_interval};" \
           "i=$((i+1)); " \
-        "done"
+        "done",
       ],
-      verify_result: verify_result
+      verify_result: verify_result,
     }
   end
 end

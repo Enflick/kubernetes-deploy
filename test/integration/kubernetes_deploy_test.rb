@@ -8,12 +8,16 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
     hello_cloud.assert_all_up
 
     assert_logs_match_all([
+      "All required parameters and files are present",
       "Deploying ConfigMap/hello-cloud-configmap-data (timeout: 30s)",
-      %r{Deploying Pod/unmanaged-pod-[-\w]+ \(timeout: 60s\)}, # annotation timeout override
+      /Deploying resources:/,
+      %r{- Pod/unmanaged-pod-1-[-\w]+ \(timeout: 60s\)}, # annotation timeout override
+      %r{- Pod/unmanaged-pod-2-[-\w]+ \(timeout: 60s\)}, # annotation timeout override
       "Hello from the command runner!", # unmanaged pod logs
       "Result: SUCCESS",
-      "Successfully deployed 21 resources"
+      "Successfully deployed 25 resources",
     ], in_order: true)
+    refute_logs_match(/Using resource selector/)
 
     num_ds = expected_daemonset_pod_count
     assert_logs_match_all([
@@ -36,8 +40,8 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
     # Add a valid service account in unmanaged pod
     service_account_name = "build-robot"
     result = deploy_fixtures("hello-cloud",
-      subset: ["configmap-data.yml", "unmanaged-pod.yml.erb", "service-account.yml"]) do |fixtures|
-      pod = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
+      subset: ["configmap-data.yml", "unmanaged-pod-1.yml.erb", "service-account.yml"]) do |fixtures|
+      pod = fixtures["unmanaged-pod-1.yml.erb"]["Pod"].first
       pod["spec"]["serviceAccountName"] = service_account_name
       pod["spec"]["automountServiceAccountToken"] = false
     end
@@ -46,10 +50,10 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
     hello_cloud = FixtureSetAssertions::HelloCloud.new(@namespace)
     hello_cloud.assert_configmap_data_present
     hello_cloud.assert_all_service_accounts_up
-    hello_cloud.assert_unmanaged_pod_statuses("Succeeded")
+    hello_cloud.assert_unmanaged_pod_statuses("Succeeded", 1)
     assert_logs_match_all([
       %r{Successfully deployed in \d.\ds: ServiceAccount/build-robot},
-      %r{Successfully deployed in \d.\ds: Pod/unmanaged-pod-.*}
+      %r{Successfully deployed in \d+.\ds: Pod/unmanaged-pod-.*},
     ], in_order: true)
   end
 
@@ -58,10 +62,10 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
       "hello-cloud",
       subset: [
         "configmap-data.yml",
-        "unmanaged-pod.yml.erb",
+        "unmanaged-pod-1.yml.erb",
         "role-binding.yml",
         "role.yml",
-        "service-account.yml"
+        "service-account.yml",
       ]
     )
 
@@ -72,11 +76,11 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
     hello_cloud.assert_all_service_accounts_up
     hello_cloud.assert_all_roles_up
     hello_cloud.assert_all_role_bindings_up
-    hello_cloud.assert_unmanaged_pod_statuses("Succeeded")
+    hello_cloud.assert_unmanaged_pod_statuses("Succeeded", 1)
     assert_logs_match_all([
       %r{Successfully deployed in \d.\ds: Role/role},
       %r{Successfully deployed in \d.\ds: RoleBinding/role-binding},
-      %r{Successfully deployed in \d.\ds: Pod/unmanaged-pod-.*}
+      %r{Successfully deployed in \d+.\ds: Pod/unmanaged-pod-1-.*},
     ], in_order: true)
   end
 
@@ -94,6 +98,7 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
       prune_matcher("configmap", "", "hello-cloud-configmap-data"),
       prune_matcher("pod", "", "unmanaged-pod-"),
       prune_matcher("service", "", "web"),
+      prune_matcher("service", "", "stateful-busybox"),
       prune_matcher("resourcequota", "", "resource-quotas"),
       prune_matcher("deployment", "extensions", "web"),
       prune_matcher("ingress", "extensions", "web"),
@@ -101,8 +106,15 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
       prune_matcher("statefulset", "apps", "stateful-busybox"),
       prune_matcher("job", "batch", "hello-job"),
       prune_matcher("poddisruptionbudget", "policy", "test"),
+      prune_matcher("networkpolicy", "networking.k8s.io", "allow-all-network-policy"),
+      prune_matcher("secret", "", "hello-secret"),
+      prune_matcher("replicaset", "extensions", "bare-replica-set"),
+      prune_matcher("serviceaccount", "", "build-robot"),
+      prune_matcher("podtemplate", "", "hello-cloud-template-runner"),
+      prune_matcher("role", "rbac.authorization.k8s.io", "role"),
+      prune_matcher("rolebinding", "rbac.authorization.k8s.io", "role-binding"),
     ] # not necessarily listed in this order
-    expected_msgs = [/Pruned 10 resources and successfully deployed 6 resources/]
+    expected_msgs = [/Pruned 19 resources and successfully deployed 6 resources/]
     expected_pruned.map do |resource|
       expected_msgs << /The following resources were pruned:.*#{resource}/
     end
@@ -119,13 +131,64 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
     hello_cloud.assert_poddisruptionbudget
   end
 
+  def test_selector
+    # Deploy the same thing twice with a different selector
+    assert_deploy_success(deploy_fixtures("branched",
+      bindings: { "branch" => "master" },
+      selector: KubernetesDeploy::LabelSelector.parse("branch=master")))
+    assert_logs_match("Using resource selector branch=master")
+    assert_deploy_success(deploy_fixtures("branched",
+      bindings: { "branch" => "staging" },
+      selector: KubernetesDeploy::LabelSelector.parse("branch=staging")))
+    assert_logs_match("Using resource selector branch=staging")
+    deployments = v1beta1_kubeclient.get_deployments(namespace: @namespace, label_selector: "app=branched")
+
+    assert_equal(2, deployments.size)
+    assert_equal(%w(master staging), deployments.map { |d| d.metadata.labels.branch }.sort)
+
+    # Run again without selector to verify pruning works
+    assert_deploy_success(deploy_fixtures("branched", bindings: { "branch" => "master" }))
+    deployments = v1beta1_kubeclient.get_deployments(namespace: @namespace, label_selector: "app=branched")
+    # Filter out pruned resources pending deletion
+    deployments.select! { |deployment| deployment.metadata.deletionTimestamp.nil? }
+
+    assert_equal(1, deployments.size)
+    assert_equal("master", deployments.first.metadata.labels.branch)
+  end
+
+  def test_mismatched_selector
+    assert_deploy_failure(deploy_fixtures("branched",
+      bindings: { "branch" => "master" },
+      selector: KubernetesDeploy::LabelSelector.parse("branch=staging")))
+    assert_logs_match_all([
+      /Using resource selector branch=staging/,
+      /Template validation failed/,
+      /Invalid template: Deployment/,
+      /selector branch=staging does not match labels app=branched,branch=master/,
+      /> Template content:/,
+    ], in_order: true)
+  end
+
+  def test_mismatched_selector_on_replace_resource_without_labels
+    assert_deploy_failure(deploy_fixtures("hello-cloud",
+      subset: %w(disruption-budgets.yml),
+      selector: KubernetesDeploy::LabelSelector.parse("branch=staging")))
+    assert_logs_match_all([
+      /Using resource selector branch=staging/,
+      /Template validation failed/,
+      /Invalid template: PodDisruptionBudget/,
+      /selector branch=staging passed in, but no labels were defined/,
+      /> Template content:/,
+    ], in_order: true)
+  end
+
   def test_refuses_deploy_to_protected_namespace_with_override_if_pruning_enabled
     generated_ns = @namespace
     @namespace = 'default'
     assert_deploy_failure(deploy_fixtures("hello-cloud", allow_protected_ns: true, prune: true))
     assert_logs_match_all([
       "Configuration invalid",
-      "- Refusing to deploy to protected namespace 'default' with pruning enabled"
+      "- Refusing to deploy to protected namespace 'default' with pruning enabled",
     ], in_order: true)
   ensure
     @namespace = generated_ns
@@ -137,7 +200,7 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
     assert_deploy_failure(deploy_fixtures("hello-cloud", prune: false))
     assert_logs_match_all([
       "Configuration invalid",
-      "- Refusing to deploy to protected namespace"
+      "- Refusing to deploy to protected namespace",
     ], in_order: true)
   ensure
     @namespace = generated_ns
@@ -154,21 +217,15 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
   end
 
   def test_success_with_unrecognized_resource_type
-    # Secrets are intentionally unsupported because they should not be committed to your repo
-    secret = {
-      "apiVersion" => "v1",
-      "kind" => "Secret",
-      "metadata" => { "name" => "test" },
-      "data" => { "foo" => "YmFy" }
-    }
+    resource_kind = "ReplicationController"
+    resource_name = "test-rc"
 
-    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml"]) do |fixtures|
-      fixtures["secret.yml"] = { "Secret" => secret }
-    end
+    result = deploy_fixtures("unrecognized-type")
     assert_deploy_success(result)
 
-    live_secret = kubeclient.get_secret("test", @namespace)
-    assert_equal({ foo: "YmFy" }, live_secret["data"].to_h)
+    # This will raise an exception if the resource is missing
+    kubeclient.get_entity(resource_kind.downcase.pluralize, resource_name, @namespace)
+    assert_logs_match(/Don't know how to monitor resources of type #{resource_kind}/)
   end
 
   def test_invalid_yaml_fails_fast
@@ -178,7 +235,7 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
       "Invalid template: yaml-error.yml",
       "mapping values are not allowed in this context",
       "> Template content:",
-      "datapoint1: value1:"
+      "datapoint1: value1:",
     ], in_order: true)
   end
 
@@ -190,11 +247,11 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
       "Failed to render and parse template",
       %r{Invalid template: .*/partials/invalid.yml.erb \(#{included_from}\)},
       "> Error message:",
-      "(<unknown>): mapping values are not allowed in this context",
+      %r{fixtures/partials/invalid.yml.erb\)\: mapping values are not allowed in this context},
       "> Template content:",
       "containers:",
       "- name: invalid-container",
-      "notField: notval:"
+      "notField: notval:",
     ], in_order: true)
 
     # make sure we're not displaying duplicate errors
@@ -227,7 +284,7 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
       "> Error message:",
       %r{Could not find partial 'does-not-exist' in any of .*fixture_dir[^/]*/partials:.*/partials},
       "> Template content:",
-      "<%= partial 'does-not-exist' %>"
+      "<%= partial 'does-not-exist' %>",
     ], in_order: true)
   end
 
@@ -245,17 +302,17 @@ class KubernetesDeployTest < KubernetesDeploy::IntegrationTest
       "error validating data: ValidationError(ConfigMap.metadata): \
 unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "> Template content:",
-      "      myKey: uhOh"
+      "      myKey: uhOh",
     ], in_order: true)
   end
 
   def test_dynamic_erb_collection_works
-    assert_deploy_success deploy_raw_fixtures("collection-with-erb",
-      bindings: { binding_test_a: 'foo', binding_test_b: 'bar' })
+    assert_deploy_success(deploy_raw_fixtures("collection-with-erb",
+      bindings: { binding_test_a: 'foo', binding_test_b: 'bar' }))
 
     deployments = v1beta1_kubeclient.get_deployments(namespace: @namespace)
-    assert_equal 3, deployments.size
-    assert_equal ["web-one", "web-three", "web-two"], deployments.map { |d| d.metadata.name }.sort
+    assert_equal(3, deployments.size)
+    assert_equal(["web-one", "web-three", "web-two"], deployments.map { |d| d.metadata.name }.sort)
   end
 
   # The next three tests reproduce a k8s bug
@@ -285,7 +342,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "> Error message:",
       /Error from server \(Invalid\): error when creating.*Service "web" is invalid/,
       "> Template content:",
-      "        targetPort: http_test_is_really_long_and_invalid_chars"
+      "        targetPort: http_test_is_really_long_and_invalid_chars",
     ], in_order: true)
   end
 
@@ -300,43 +357,24 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "WARNING: Any resources not mentioned in the error(s) below were likely created/updated.",
       "Unidentified error(s):",
       '    The Service "web" is invalid:',
-      'spec.ports[0].targetPort: Invalid value: "http_test_is_really_long_and_invalid_chars"'
+      'spec.ports[0].targetPort: Invalid value: "http_test_is_really_long_and_invalid_chars"',
     ], in_order: true)
-  end
-
-  def test_bad_container_image_on_unmanaged_pod_halts_and_fails_deploy
-    result = deploy_fixtures("hello-cloud") do |fixtures|
-      pod = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
-      pod["spec"]["containers"].first["image"] = "hello-world:thisImageIsBad"
-    end
-    assert_deploy_failure(result)
-    assert_logs_match_all([
-      "Failed to deploy 1 priority resource",
-      %r{Pod\/unmanaged-pod-\w+-\w+: FAILED},
-      "hello-cloud: Failed to pull image"
-    ], in_order: true)
-
-    hello_cloud = FixtureSetAssertions::HelloCloud.new(@namespace)
-    hello_cloud.assert_unmanaged_pod_statuses("Pending")
-    hello_cloud.assert_configmap_data_present # priority resource
-    hello_cloud.refute_redis_resources_exist(expect_pvc: true) # pvc is priority resource
-    hello_cloud.refute_web_resources_exist
   end
 
   def test_output_of_failed_unmanaged_pod
-    result = deploy_fixtures("hello-cloud", subset: ["unmanaged-pod.yml.erb", "configmap-data.yml"]) do |fixtures|
-      pod = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
+    result = deploy_fixtures("hello-cloud", subset: ["unmanaged-pod-1.yml.erb", "configmap-data.yml"]) do |fixtures|
+      pod = fixtures["unmanaged-pod-1.yml.erb"]["Pod"].first
       pod["spec"]["containers"].first["command"] = ["/not/a/command"]
     end
     assert_deploy_failure(result)
     hello_cloud = FixtureSetAssertions::HelloCloud.new(@namespace)
-    hello_cloud.assert_unmanaged_pod_statuses("Failed")
+    hello_cloud.assert_unmanaged_pod_statuses("Failed", 1)
     hello_cloud.refute_web_resources_exist
 
     assert_logs_match_all([
       "Failed to deploy 1 priority resource",
       "Pod status: Failed. The following containers encountered errors:",
-      "> hello-cloud: Failed to start (exit 127):"
+      "> hello-cloud: Failed to start (exit 127):",
     ], in_order: true)
   end
 
@@ -356,26 +394,10 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Deployment/web: FAILED",
       "The following containers are in a state that is unlikely to be recoverable:",
       /app: Failed to generate container configuration: secrets? \"monitoring-token\" not found/,
-      "Final status: 3 replicas, 3 updatedReplicas, 3 unavailableReplicas"
+      "Final status: 3 replicas, 3 updatedReplicas, 3 unavailableReplicas",
     ], in_order: true)
 
     assert_logs_match("The following containers are in a state that is unlikely to be recoverable", 1) # no duplicates
-  end
-
-  def test_bad_container_image_on_deployment_pod_fails_quickly
-    result = deploy_fixtures("invalid", subset: ["cannot_run.yml"]) do |fixtures|
-      container = fixtures["cannot_run.yml"]["Deployment"].first["spec"]["template"]["spec"]["containers"].first
-      container["image"] = "some-invalid-image:badtag"
-    end
-    assert_deploy_failure(result)
-
-    assert_logs_match_all([
-      "Failed to deploy 1 resource",
-      "Deployment/cannot-run: FAILED",
-      "The following containers are in a state that is unlikely to be recoverable:",
-      "container-cannot-run: Failed to pull image some-invalid-image:badtag.",
-      "Did you wait for it to be built and pushed to the registry before deploying?"
-    ], in_order: true)
   end
 
   def test_bad_init_container_on_deployment_fails_quickly
@@ -384,7 +406,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Deployment/init-crash: FAILED",
       "The following containers are in a state that is unlikely to be recoverable:",
       "init-crash-loop-back-off: Crashing repeatedly (exit 1). See logs for more information.",
-      "this is a log from the crashing init container"
+      "this is a log from the crashing init container",
     ], in_order: true)
   end
 
@@ -396,7 +418,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Deployment/crash-loop: FAILED",
       "The following containers are in a state that is unlikely to be recoverable:",
       "crash-loop-back-off: Crashing repeatedly (exit 1). See logs for more information.",
-      "this is a log from the crashing container"
+      "this is a log from the crashing container",
     ], in_order: true)
   end
 
@@ -409,22 +431,22 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "The following containers are in a state that is unlikely to be recoverable:",
       %r{container-cannot-run: Failed to start \(exit 127\): .*/some/bad/path},
       "Logs from container 'successful-init'",
-      "Log from successful init container"
+      "Log from successful init container",
     ], in_order: true)
     assert_logs_match("no such file or directory")
   end
 
   def test_wait_false_still_waits_for_priority_resources
     result = deploy_fixtures("hello-cloud") do |fixtures|
-      pod = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
+      pod = fixtures["unmanaged-pod-1.yml.erb"]["Pod"].first
       pod["spec"]["containers"].first["image"] = "hello-world:thisImageIsBad"
     end
     assert_deploy_failure(result)
     assert_logs_match_all([
       "Failed to deploy 1 priority resource",
-      %r{Pod\/unmanaged-pod-\w+-\w+: FAILED},
+      %r{Pod\/unmanaged-pod-1-\w+-\w+: FAILED},
       "The following containers encountered errors:",
-      "hello-cloud: Failed to pull image hello-world:thisImageIsBad"
+      "hello-cloud: Failed to pull image hello-world:thisImageIsBad",
     ])
   end
 
@@ -442,8 +464,38 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_logs_match_all([
       "Successfully deployed 1 resource and timed out waiting for 1 resource to deploy",
       'Deployment/undying: TIMED OUT (progress deadline: 10s)',
-      'Timeout reason: ProgressDeadlineExceeded'
+      'Timeout reason: ProgressDeadlineExceeded',
     ])
+  end
+
+  def test_deployment_with_timeout_override_deprecated
+    result = deploy_fixtures("long-running", subset: ['undying-deployment.yml.erb']) do |fixtures|
+      deployment = fixtures['undying-deployment.yml.erb']['Deployment'].first
+      deployment['spec']['progressDeadlineSeconds'] = 5
+      deployment["metadata"]["annotations"] = {
+        KubernetesDeploy::KubernetesResource::TIMEOUT_OVERRIDE_ANNOTATION_DEPRECATED => "10S",
+      }
+      container = deployment['spec']['template']['spec']['containers'].first
+      container['readinessProbe'] = { "exec" => { "command" => ['- ls'] } }
+    end
+    assert_deploy_failure(result, :timed_out)
+    assert_logs_match_all(KubernetesDeploy::KubernetesResource::STANDARD_TIMEOUT_MESSAGE.split("\n") +
+      ["timeout override: 10s"])
+  end
+
+  def test_deployment_with_timeout_override
+    result = deploy_fixtures("long-running", subset: ['undying-deployment.yml.erb']) do |fixtures|
+      deployment = fixtures['undying-deployment.yml.erb']['Deployment'].first
+      deployment['spec']['progressDeadlineSeconds'] = 5
+      deployment["metadata"]["annotations"] = {
+        KubernetesDeploy::KubernetesResource::TIMEOUT_OVERRIDE_ANNOTATION => "10S",
+      }
+      container = deployment['spec']['template']['spec']['containers'].first
+      container['readinessProbe'] = { "exec" => { "command" => ['- ls'] } }
+    end
+    assert_deploy_failure(result, :timed_out)
+    assert_logs_match_all(KubernetesDeploy::KubernetesResource::STANDARD_TIMEOUT_MESSAGE.split("\n") +
+      ["timeout override: 10s"])
   end
 
   def test_wait_false_ignores_non_priority_resource_failures
@@ -455,7 +507,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_logs_match_all([
       "Result: SUCCESS",
       "Deployed 3 resources",
-      "Deploy result verification is disabled for this deploy."
+      "Deploy result verification is disabled for this deploy.",
     ], in_order: true)
   end
 
@@ -465,8 +517,8 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_deploy_success(result)
 
     map = kubeclient.get_config_map('extra-binding', @namespace).data
-    assert_equal 'binding_test_a', map['BINDING_TEST_A']
-    assert_equal 'binding_test_b', map['BINDING_TEST_B']
+    assert_equal('binding_test_a', map['BINDING_TEST_A'])
+    assert_equal('binding_test_b', map['BINDING_TEST_B'])
   end
 
   def test_deploy_fails_if_required_binding_not_present
@@ -478,7 +530,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "> Error message:",
       "undefined local variable or method `binding_test_a'",
       "> Template content:",
-      'BINDING_TEST_A: "<%= binding_test_a %>"'
+      'BINDING_TEST_A: "<%= binding_test_a %>"',
     ], in_order: true)
   end
 
@@ -506,28 +558,30 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       fixtures["secrets.ejson"]["kubernetes_secrets"]["monitoring-token"]["data"] = malformed
     end
     assert_deploy_failure(result)
-    assert_logs_match("Creation of kubernetes secrets from ejson failed: data for secret monitoring-token was invalid")
+    assert_logs_match(
+      "Generation of kubernetes secrets from ejson failed: data for secret monitoring-token was invalid"
+    )
   end
 
   def test_pruning_of_secrets_created_from_ejson
     ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
     ejson_cloud.create_ejson_keys_secret
     assert_deploy_success(deploy_fixtures("ejson-cloud"))
-    ejson_cloud.assert_secret_present('unused-secret', managed: true)
+    ejson_cloud.assert_secret_present('unused-secret', ejson: true)
 
     result = deploy_fixtures("ejson-cloud") do |fixtures|
       fixtures["secrets.ejson"]["kubernetes_secrets"].delete("unused-secret")
     end
     assert_deploy_success(result)
-    assert_logs_match(/Pruning secret unused-secret/)
+    assert_logs_match(%r{The following resources were pruned:.*secret( "|\/)unused-secret})
 
     # The removed secret was pruned
     ejson_cloud.refute_resource_exists('secret', 'unused-secret')
     # The remaining secrets exist
-    ejson_cloud.assert_secret_present('monitoring-token', managed: true)
-    ejson_cloud.assert_secret_present('catphotoscom', type: 'kubernetes.io/tls', managed: true)
+    ejson_cloud.assert_secret_present('monitoring-token', ejson: true)
+    ejson_cloud.assert_secret_present('catphotoscom', type: 'kubernetes.io/tls', ejson: true)
     # The unmanaged secret was not pruned
-    ejson_cloud.assert_secret_present('ejson-keys', managed: false)
+    ejson_cloud.assert_secret_present('ejson-keys', ejson: false)
   end
 
   def test_pruning_of_existing_managed_secrets_when_ejson_file_has_been_deleted
@@ -542,44 +596,65 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_deploy_success(result)
 
     assert_logs_match_all([
-      "Pruning secret unused-secret",
-      "Pruning secret catphotoscom",
-      "Pruning secret monitoring-token"
+      %r{The following resources were pruned:.*secret( "|\/)catphotoscom},
+      %r{The following resources were pruned:.*secret( "|\/)monitoring-token},
+      %r{The following resources were pruned:.*secret( "|\/)unused-secret},
     ])
 
     ejson_cloud.refute_resource_exists('secret', 'unused-secret')
     ejson_cloud.refute_resource_exists('secret', 'catphotoscom')
     ejson_cloud.refute_resource_exists('secret', 'monitoring-token')
+
+    # Check ejson-keys is not deleted
+    ejson_cloud.assert_secret_present('ejson-keys')
+  end
+
+  def test_can_deploy_template_dir_with_only_secrets_ejson
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.create_ejson_keys_secret
+    assert_deploy_success(deploy_fixtures("ejson-cloud", subset: ["secrets.ejson"]))
+    assert_logs_match_all([
+      "Result: SUCCESS",
+      %r{Secret\/catphotoscom\s+Available},
+      %r{Secret\/monitoring-token\s+Available},
+      %r{Secret\/unused-secret\s+Available},
+    ], in_order: true)
+  end
+
+  def test_ejson_works_with_label_selectors
+    value = "master"
+    selector = KubernetesDeploy::LabelSelector.parse("branch=#{value}")
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.create_ejson_keys_secret
+    assert_deploy_success(deploy_fixtures("ejson-cloud", subset: ["secrets.ejson"], selector: selector))
+    assert_logs_match_all([
+      "Result: SUCCESS",
+      %r{Secret\/catphotoscom\s+Available},
+      %r{Secret\/monitoring-token\s+Available},
+      %r{Secret\/unused-secret\s+Available},
+    ], in_order: true)
+    secret = kubeclient.get_secret('catphotoscom', @namespace)
+    assert_equal(value, secret.metadata.labels.to_h[:branch])
   end
 
   def test_deploy_result_logging_for_mixed_result_deploy
     subset = ["bad_probe.yml", "init_crash.yml", "missing_volumes.yml", "config_map.yml"]
     result = deploy_fixtures("invalid", subset: subset) do |f|
-      if kube_server_version >= Gem::Version.new("1.10.0") # https://github.com/kubernetes/kubernetes/issues/66135
-        f["bad_probe.yml"]["Deployment"].first["spec"]["progressDeadlineSeconds"] = 20
-      end
+      f["bad_probe.yml"]["Deployment"].first["spec"]["progressDeadlineSeconds"] = 20
     end
 
     assert_deploy_failure(result)
     assert_logs_match_all([
       "Successfully deployed 1 resource, timed out waiting for 2 resources to deploy, and failed to deploy 1 resource",
       "Successful resources",
-      %r{ConfigMap/test\s+Available}
+      %r{ConfigMap/test\s+Available},
     ], in_order: true)
 
-    if kube_server_version < Gem::Version.new("1.10.0")
-      start_bad_probe_logs = [
-        %r{Deployment/bad-probe: TIMED OUT \(timeout: \d+s\)},
-        "Timeout reason: hard deadline for Deployment"
-      ]
-      end_bad_probe_logs = [/Unhealthy: Readiness probe failed:.*\(\d+ events\)/] # event
-    else
-      start_bad_probe_logs = [
-        %r{Deployment/bad-probe: TIMED OUT \(progress deadline: \d+s\)},
-        "Timeout reason: ProgressDeadlineExceeded"
-      ]
-      end_bad_probe_logs = ["Scaled up replica set bad-probe-"] # event
-    end
+    start_bad_probe_logs = [
+      %r{Deployment/bad-probe: TIMED OUT \(progress deadline: \d+s\)},
+      "Timeout reason: ProgressDeadlineExceeded",
+    ]
+    end_bad_probe_logs = ["Scaled up replica set bad-probe-"] # event
 
     # Debug info for bad probe timeout
     assert_logs_match_all(start_bad_probe_logs + [
@@ -608,7 +683,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "init-crash-loop-back-off: Crashing repeatedly (exit 1). See logs for more information.",
       "Final status: 1 replica, 1 updatedReplica, 1 unavailableReplica",
       "Scaled up replica set init-crash-", # event
-      "this is a log from the crashing init container"
+      "this is a log from the crashing init container",
     ], in_order: true)
 
     # Excludes noisy events
@@ -621,25 +696,41 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     original_ns = @namespace
     @namespace = 'this-certainly-should-not-exist'
     assert_deploy_failure(deploy_fixtures("hello-cloud", subset: ['configmap-data.yml']))
-    assert_logs_match(/Result: FAILURE.*namespaces "this-certainly-should-not-exist" not found/m)
+    assert_logs_match_all([
+      "Result: FAILURE",
+      "Namespace this-certainly-should-not-exist not found",
+    ], in_order: true)
   ensure
     @namespace = original_ns
   end
 
-  def test_failure_logs_from_unmanaged_pod_appear_in_summary_section
-    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "unmanaged-pod.yml.erb"]) do |fixtures|
-      pod = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
+  def test_unmanaged_pod_failure_halts_deploy_and_displays_logs_correctly
+    result = deploy_fixtures(
+      "hello-cloud",
+      subset: ["configmap-data.yml", "unmanaged-pod-1.yml.erb", "unmanaged-pod-2.yml.erb", "web.yml.erb"]
+    ) do |fixtures|
+      pod = fixtures["unmanaged-pod-1.yml.erb"]["Pod"].first
       container = pod["spec"]["containers"].first
       container["command"] = ["sh", "-c", "/some/bad/path"] # should throw an error
     end
     assert_deploy_failure(result)
 
     assert_logs_match_all([
+      "Logs from Pod/unmanaged-pod-2",
+      "Hello from the second command runner!", # logs from successful pod printed before summary
+      "Result: FAILURE",
       "Failed to deploy 1 priority resource",
-      "Logs from container 'hello-cloud':",
-      "sh: /some/bad/path: not found" # from logs
+      %r{Pod\/unmanaged-pod-1-\w+-\w+: FAILED},
+      "Logs from container 'hello-cloud'",
+      "sh: /some/bad/path: not found", # logs from failed pod printed in summary
     ], in_order: true)
-    refute_logs_match(/no such file or directory.*Result\: FAILURE/m) # logs not also displayed before summary
+    refute_logs_match(%r{some/bad/path.*Result\: FAILURE}m) # failed pod logs not also displayed before summary
+
+    hello_cloud = FixtureSetAssertions::HelloCloud.new(@namespace)
+    hello_cloud.assert_unmanaged_pod_statuses("Failed", 1)
+    hello_cloud.assert_unmanaged_pod_statuses("Succeeded", 1)
+    hello_cloud.assert_configmap_data_present # priority resource
+    hello_cloud.refute_web_resources_exist
   end
 
   # ref https://github.com/kubernetes/kubernetes/issues/26202
@@ -655,7 +746,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Command failed: apply -f",
       "WARNING: Any resources not mentioned in the error(s) below were likely created/updated.",
       "Unidentified error(s):",
-      /The Deployment "web" is invalid.*`selector` does not match template `labels`/
+      /The Deployment "web" is invalid.*`selector` does not match template `labels`/,
     ], in_order: true)
   end
 
@@ -685,10 +776,10 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     hello_cloud.assert_pod_status(pod_name, pod_status, target)
 
     assert_logs_match_all([
-      %r{Service/web\s+Selects at least 1 pod},
       %r{Deployment/web\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Service/web\s+Selects at least 1 pod},
+      %r{Deployment/web\s+0 replicas},
       %r{Service/web\s+Doesn't require any endpoint},
-      %r{Deployment/web\s+0 replicas}
     ], in_order: true)
   end
 
@@ -700,11 +791,27 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_deploy_success(result)
 
     pods = kubeclient.get_pods(namespace: @namespace)
-    assert_equal 0, pods.length, "Pods were running from zero-replica deployment"
+    assert_equal(0, pods.length, "Pods were running from zero-replica deployment")
 
     assert_logs_match_all([
       %r{Service/web\s+Doesn't require any endpoint},
-      %r{Deployment/web\s+0 replicas}
+      %r{Deployment/web\s+0 replicas},
+    ])
+  end
+
+  def test_can_deploy_statefulset_with_zero_replicas
+    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "stateful_set.yml"]) do |fixtures|
+      stateful = fixtures["stateful_set.yml"]["StatefulSet"].first
+      stateful["spec"]["replicas"] = 0
+    end
+    assert_deploy_success(result)
+
+    pods = kubeclient.get_pods(namespace: @namespace)
+    assert_equal(0, pods.length, "Pods were running from zero-replica deployment")
+
+    assert_logs_match_all([
+      %r{Service/stateful-busybox\s+Doesn't require any endpoint},
+      %r{StatefulSet/stateful-busybox\s+0 replicas},
     ])
   end
 
@@ -717,19 +824,151 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       container = dep["spec"]["template"]["spec"]["containers"].first
       container["readinessProbe"] = {
         "exec" => { "command" => %w(sleep 5) },
-        "timeoutSeconds" => 6
+        "timeoutSeconds" => 6,
       }
     end
     assert_deploy_success(result)
 
     new_pods = kubeclient.get_pods(namespace: @namespace, label_selector: 'name=web,app=slow-cloud,sha=deploy2')
-    assert new_pods.length >= 1, "Expected at least one new pod, saw #{new_pods.length}"
+    assert(new_pods.length >= 1, "Expected at least one new pod, saw #{new_pods.length}")
 
     new_ready_pods = new_pods.select do |pod|
       pod.status.phase == "Running" &&
       pod.status.conditions.any? { |condition| condition["type"] == "Ready" && condition["status"] == "True" }
     end
-    assert_equal 1, new_ready_pods.length, "Expected exactly one new pod to be ready, saw #{new_ready_pods.length}"
+    assert_equal(1, new_ready_pods.length, "Expected exactly one new pod to be ready, saw #{new_ready_pods.length}")
+  end
+
+  def test_deploy_successful_with_multiple_template_paths
+    result = deploy_dirs(fixture_path("test-partials"), fixture_path("cronjobs"),
+      bindings: { 'supports_partials' => 'yep' })
+    assert_deploy_success(result)
+
+    assert_logs_match_all([
+      %r{ConfigMap/config-for-pod1\s+Available},
+      %r{ConfigMap/config-for-pod2\s+Available},
+      %r{ConfigMap/independent-configmap\s+Available},
+      %r{CronJob/my-cronjob\s+Exists},
+      %r{Deployment/web\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Pod/pod1\s+Succeeded},
+      %r{Pod/pod2\s+Succeeded},
+    ])
+  end
+
+  def test_deploy_successful_with_multiple_template_paths_multiple_partials
+    result = deploy_dirs(fixture_path("test-partials"), fixture_path("test-partials2"),
+      bindings: { 'supports_partials' => 'yep' })
+    assert_deploy_success(result)
+
+    assert_logs_match_all([
+      %r{ConfigMap/config-for-pod1\s+Available},
+      %r{ConfigMap/config-for-pod2\s+Available},
+      %r{ConfigMap/independent-configmap\s+Available},
+      %r{Deployment/web\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Deployment/web-from-partial\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Pod/pod1\s+Succeeded},
+      %r{Pod/pod2\s+Succeeded},
+    ])
+  end
+
+  def test_deploy_successful_partials_with_filename_args
+    partial_file_1 = File.join(fixture_path("test-partials"), "deployment.yaml.erb")
+    partial_file_2 = File.join(fixture_path("test-partials2"), "deployment.yml.erb")
+    result = deploy_dirs(partial_file_1, partial_file_2, bindings: { 'supports_partials' => 'yep' })
+    assert_deploy_success(result)
+
+    assert_logs_match_all([
+      %r{ConfigMap/config-for-pod1\s+Available},
+      %r{ConfigMap/config-for-pod2\s+Available},
+      %r{ConfigMap/independent-configmap\s+Available},
+      %r{Deployment/web\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Deployment/web-from-partial\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Pod/pod1\s+Succeeded},
+      %r{Pod/pod2\s+Succeeded},
+    ])
+  end
+
+  def test_ejson_secrets_are_created_from_multiple_template_paths
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.create_ejson_keys_secret
+
+    result = deploy_dirs(fixture_path("ejson-cloud"), fixture_path("ejson-cloud2"))
+    assert_deploy_success(result)
+
+    assert_logs_match_all([
+      %r{Deployment/web\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Secret/a-secret\s+Available},
+      %r{Secret/catphotoscom\s+Available},
+      %r{Secret/monitoring-token\s+Available},
+      %r{Secret/unused-secret\s+Available},
+    ])
+  end
+
+  def test_deploy_successful_with_filename_arg
+    result = deploy_dirs(File.join(fixture_path("hello-cloud"), "service-account.yml"))
+    assert_deploy_success(result)
+    assert_logs_match_all([
+      "Successfully deployed 1 resource",
+      %r{ServiceAccount/build-robot(\s+)Created},
+    ], in_order: true)
+  end
+
+  def test_deploy_successful_with_both_filename_and_template_dir
+    filepath = File.join(fixture_path("hello-cloud"), "service-account.yml")
+    result = deploy_dirs(filepath, fixture_path("cronjobs"))
+    assert_deploy_success(result)
+    assert_logs_match_all([
+      "Successfully deployed 2 resources",
+      %r{CronJob/my-cronjob(\s+)Exists},
+      %r{ServiceAccount/build-robot(\s+)Created},
+    ], in_order: true)
+  end
+
+  def test_deploy_successful_multiple_filenames_different_directories
+    hello_cloud_file = File.join(fixture_path("hello-cloud"), "service-account.yml")
+    cronjob_file = File.join(fixture_path("cronjobs"), "cronjob.yaml.erb")
+    result = deploy_dirs(hello_cloud_file, cronjob_file)
+    assert_deploy_success(result)
+    assert_logs_match_all([
+      "Successfully deployed 2 resources",
+      %r{CronJob/my-cronjob(\s+)Exists},
+      %r{ServiceAccount/build-robot(\s+)Created},
+    ], in_order: true)
+  end
+
+  def test_deploy_successful_with_filename_arg_requiring_ejson
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.create_ejson_keys_secret
+
+    ejson_path = fixture_path("ejson-cloud")
+    secrets_file = File.join(ejson_path, "secrets.ejson")
+    web_file = File.join(ejson_path, "web.yaml")
+
+    result = deploy_dirs(secrets_file, web_file)
+    assert_deploy_success(result)
+    assert_logs_match_all([
+      %r{Deployment/web\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Secret/catphotoscom\s+Available},
+      %r{Secret/monitoring-token\s+Available},
+      %r{Secret/unused-secret\s+Available},
+    ])
+  end
+
+  def test_only_explicitly_listed_ejson_secrets_deployed_when_specifying_filename_args
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.create_ejson_keys_secret
+
+    web_file = File.join(fixture_path("ejson-cloud2"), "web.yml")
+    ejson_dir = fixture_path("ejson-cloud")
+    result = deploy_dirs(web_file, ejson_dir)
+    assert_deploy_success(result)
+    assert_logs_match_all([
+      %r{Deployment/web\s+1 replica, 1 updatedReplica, 1 availableReplica},
+      %r{Secret/catphotoscom\s+Available},
+      %r{Secret/monitoring-token\s+Available},
+      %r{Secret/unused-secret\s+Available},
+    ])
+    refute_logs_match(%r{Secret/a-secret\s+Available})
   end
 
   def test_deploy_aborts_immediately_if_metadata_name_missing
@@ -741,15 +980,16 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
 
     assert_logs_match_all([
       "Result: FAILURE",
-      "Template is missing required field metadata.name",
-      "Rendered template content:",
-      "kind: ConfigMap"
+      "Template is missing required field 'metadata.name'",
+      "Template content:",
+      "kind: ConfigMap",
+      'metadata: {"labels"=>{"name"=>"hello-cloud-configmap-data", "app"=>"hello-cloud"}}',
     ], in_order: true)
   end
 
   def test_deploy_aborts_immediately_if_unmanged_pod_spec_missing
-    result = deploy_fixtures("hello-cloud", subset: ["unmanaged-pod.yml.erb"]) do |fixtures|
-      definition = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
+    result = deploy_fixtures("hello-cloud", subset: ["unmanaged-pod-1.yml.erb"]) do |fixtures|
+      definition = fixtures["unmanaged-pod-1.yml.erb"]["Pod"].first
       definition.delete("spec")
     end
     assert_deploy_failure(result)
@@ -758,7 +998,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Result: FAILURE",
       "Template is missing required field spec.containers",
       "Rendered template content:",
-      "kind: Pod"
+      "kind: Pod",
     ], in_order: true)
   end
 
@@ -771,19 +1011,38 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
   end
 
   def test_output_when_unmanaged_pod_preexists
-    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "unmanaged-pod.yml.erb"]) do |fixtures|
-      pod = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
+    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "unmanaged-pod-1.yml.erb"]) do |fixtures|
+      pod = fixtures["unmanaged-pod-1.yml.erb"]["Pod"].first
       pod["metadata"]["name"] = "oops-it-is-static"
     end
     assert_deploy_success(result)
 
     # Second deploy should fail because unmanaged pod already exists
-    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "unmanaged-pod.yml.erb"]) do |fixtures|
-      pod = fixtures["unmanaged-pod.yml.erb"]["Pod"].first
+    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "unmanaged-pod-1.yml.erb"]) do |fixtures|
+      pod = fixtures["unmanaged-pod-1.yml.erb"]["Pod"].first
       pod["metadata"]["name"] = "oops-it-is-static"
     end
     assert_deploy_failure(result)
     assert_logs_match("Unmanaged pods like Pod/oops-it-is-static must have unique names on every deploy")
+  end
+
+  def test_streams_unmanaged_pod_logs_when_only_one
+    result = deploy_fixtures("hello-cloud", subset: ["configmap-data.yml", "unmanaged-pod-1.yml.erb"])
+    assert_deploy_success(result)
+    assert_logs_match(%r{Streaming logs from Pod/unmanaged-pod-1})
+
+    reset_logger
+
+    result = deploy_fixtures(
+      "hello-cloud",
+      subset: ["configmap-data.yml", "unmanaged-pod-1.yml.erb", "unmanaged-pod-2.yml.erb"]
+    )
+    assert_deploy_success(result)
+    assert_logs_match_all([
+      %r{Logs from Pod/unmanaged-pod-1},
+      %r{Logs from Pod/unmanaged-pod-2},
+    ])
+    refute_logs_match(%r{Streaming logs from Pod/unmanaged-pod})
   end
 
   def test_bad_container_on_daemon_sets_fails
@@ -797,7 +1056,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Events (common success events excluded):",
       "BackOff: Back-off restarting failed container",
       "Logs from container 'crash-loop-back-off':",
-      "this is a log from the crashing container"
+      "this is a log from the crashing container",
     ], in_order: true)
   end
 
@@ -812,13 +1071,13 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
 
     assert_deploy_failure(result)
     assert_logs_match_all([
-      "Failed to deploy 1 resource",
+      "Successfully deployed 1 resource and failed to deploy 1 resource",
       "StatefulSet/stateful-busybox: FAILED",
       "app: Crashing repeatedly (exit 1). See logs for more information.",
       "Events (common success events excluded):",
-      %r{\[Pod/stateful-busybox-\d\]	BackOff: Back-off restarting failed container},
+      %r{\[Pod/stateful-busybox-\d\]\tBackOff: Back-off restarting failed container},
       "Logs from container 'app':",
-      "ls: /not-a-dir: No such file or directory"
+      "ls: /not-a-dir: No such file or directory",
     ], in_order: true)
   end
 
@@ -829,7 +1088,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_logs_match_all([
       "WARNING: Your StatefulSet's updateStrategy is set to OnDelete",
       "Successful resources",
-      "StatefulSet/stateful-busybox"
+      "StatefulSet/stateful-busybox",
     ], in_order: true)
   end
 
@@ -843,7 +1102,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_logs_match_all([
       "Successfully deployed",
       "Successful resources",
-      %r{StatefulSet/stateful-busybox\s+2 replicas, 2 readyReplicas, 2 currentReplicas}
+      %r{StatefulSet/stateful-busybox\s+2 replicas, 2 readyReplicas, 2 currentReplicas},
     ], in_order: true)
   end
 
@@ -859,22 +1118,22 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "ResourceQuota/resource-quotas",
       %r{Deployment/web: TIMED OUT \(progress deadline: \d+s\)},
       "Timeout reason: ProgressDeadlineExceeded",
-      "failed quota: resource-quotas" # from an event
+      "failed quota: resource-quotas", # from an event
     ], in_order: true)
 
     rqs = kubeclient.get_resource_quotas(namespace: @namespace)
-    assert_equal 1, rqs.length
+    assert_equal(1, rqs.length)
 
     rq = rqs[0]
-    assert_equal "resource-quotas", rq["metadata"]["name"]
-    assert rq["spec"].present?
+    assert_equal("resource-quotas", rq["metadata"]["name"])
+    assert(rq["spec"].present?)
   end
 
   def test_ejson_secrets_respects_no_prune_flag
     ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
     ejson_cloud.create_ejson_keys_secret
     assert_deploy_success(deploy_fixtures("ejson-cloud"))
-    ejson_cloud.assert_secret_present('unused-secret', managed: true)
+    ejson_cloud.assert_secret_present('unused-secret', ejson: true)
 
     result = deploy_fixtures("ejson-cloud", prune: false) do |fixtures|
       fixtures["secrets.ejson"]["kubernetes_secrets"].delete("unused-secret")
@@ -882,26 +1141,68 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_deploy_success(result)
 
     # The removed secret was not pruned
-    ejson_cloud.assert_secret_present('unused-secret', managed: true)
+    ejson_cloud.assert_secret_present('unused-secret', ejson: true)
     # The remaining secrets also exist
-    ejson_cloud.assert_secret_present('monitoring-token', managed: true)
-    ejson_cloud.assert_secret_present('catphotoscom', type: 'kubernetes.io/tls', managed: true)
-    ejson_cloud.assert_secret_present('ejson-keys', managed: false)
+    ejson_cloud.assert_secret_present('monitoring-token', ejson: true)
+    ejson_cloud.assert_secret_present('catphotoscom', type: 'kubernetes.io/tls', ejson: true)
+    ejson_cloud.assert_secret_present('ejson-keys', ejson: false)
+  end
+
+  def test_deploy_task_fails_when_ejson_keys_prunable
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.create_ejson_keys_secret
+    secret = kubeclient.get_secret('ejson-keys', @namespace)
+    secret.metadata.annotations = {
+      "kubectl.kubernetes.io/last-applied-configuration" => "test",
+    }
+    secret = kubeclient.update_secret(secret)
+    assert(secret.metadata.annotations[KubernetesDeploy::KubernetesResource::LAST_APPLIED_ANNOTATION])
+
+    assert_deploy_failure(deploy_fixtures("hello-cloud", subset: %w(role.yml)))
+    ejson_cloud.assert_secret_present('ejson-keys')
+    assert_logs_match_all([
+      "Deploy cannot proceed because protected resource ",
+      "Secret/#{KubernetesDeploy::EjsonSecretProvisioner::EJSON_KEYS_SECRET} would be pruned.",
+      "Result: FAILURE",
+      "Found kubectl.kubernetes.io/last-applied-configuration annotation on ejson-keys secret.",
+      "kubernetes-deploy will not continue since it is extremely unlikely that this secret should be pruned.",
+    ],
+      in_order: true)
+  end
+
+  def test_deploy_task_succeeds_when_ejson_keys_prunable_but_prune_option_false
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.create_ejson_keys_secret
+    secret = kubeclient.get_secret('ejson-keys', @namespace)
+    secret.metadata.annotations = {
+      "kubectl.kubernetes.io/last-applied-configuration" => "test",
+    }
+    secret = kubeclient.update_secret(secret)
+    assert(secret.metadata.annotations[KubernetesDeploy::KubernetesResource::LAST_APPLIED_ANNOTATION])
+
+    assert_deploy_success(deploy_fixtures("hello-cloud", subset: %w(role.yml), prune: false))
+    ejson_cloud.assert_secret_present('ejson-keys')
+  end
+
+  def test_deploy_task_succeeds_when_ejson_keys_not_present
+    ejson_cloud = FixtureSetAssertions::EjsonCloud.new(@namespace)
+    ejson_cloud.refute_resource_exists("secret", "ejson-keys")
+    assert_deploy_success(deploy_fixtures("hello-cloud", subset: %w(role.yml)))
   end
 
   def test_partials
-    assert_deploy_success deploy_raw_fixtures("test-partials", bindings: { 'supports_partials' => 'true' })
+    assert_deploy_success(deploy_raw_fixtures("test-partials", bindings: { 'supports_partials' => 'true' }))
     assert_logs_match_all([
       "log from pod1",
       "log from pod2",
-      "Successfully deployed 6 resources"
+      "Successfully deployed 6 resources",
     ], in_order: false)
 
     map = kubeclient.get_config_map('config-for-pod1', @namespace).data
-    assert_equal 'true', map['supports_partials']
+    assert_equal('true', map['supports_partials'])
 
     map = kubeclient.get_config_map('independent-configmap', @namespace).data
-    assert_equal 'renderer test', map['value']
+    assert_equal('renderer test', map['value'])
   end
 
   def test_roll_back_a_bad_deploy
@@ -912,8 +1213,8 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_deploy_success(result)
     original_rs = v1beta1_kubeclient.get_replica_sets(namespace: @namespace).first
     original_rs_uid = original_rs["metadata"]["uid"]
-    assert original_rs_uid.present?
-    assert_equal 2, original_rs["status"]["availableReplicas"]
+    assert(original_rs_uid.present?)
+    assert_equal(2, original_rs["status"]["availableReplicas"])
 
     # Bad deploy
     assert_deploy_failure(deploy_fixtures("invalid", subset: ["cannot_run.yml"], sha: "REVB"))
@@ -926,9 +1227,9 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_deploy_success(result)
 
     all_rs = v1beta1_kubeclient.get_replica_sets(namespace: @namespace)
-    assert_equal 2, all_rs.length, "Test premise failure: Rollback created a new RS"
+    assert_equal(2, all_rs.length, "Test premise failure: Rollback created a new RS")
     original_rs = all_rs.find { |rs| rs["metadata"]["uid"] == original_rs_uid }
-    assert_equal 2, original_rs["status"]["availableReplicas"]
+    assert_equal(2, original_rs["status"]["availableReplicas"])
   end
 
   def test_deployment_with_recreate_strategy
@@ -963,7 +1264,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Result: FAILURE",
       "Job/hello-job: FAILED",
       "Final status: Failed",
-      %r{\[Job/hello-job\]	DeadlineExceeded: Job was active longer than specified deadline \(\d+ events\)}
+      %r{\[Job/hello-job\]\tDeadlineExceeded: Job was active longer than specified deadline \(\d+ events\)},
     ])
   end
 
@@ -974,21 +1275,13 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       max_watch_seconds: 20
     ) do |f|
       bad_probe = f["bad_probe.yml"]["Deployment"].first
-      if kube_server_version < Gem::Version.new("1.10.0") # https://github.com/kubernetes/kubernetes/issues/66135
-        bad_probe["metadata"]["annotations"]["kubernetes-deploy.shopify.io/timeout-override"] = '5s'
-      else
-        bad_probe["spec"]["progressDeadlineSeconds"] = 5
-      end
+      bad_probe["spec"]["progressDeadlineSeconds"] = 5
       f["missing_volumes.yml"]["Deployment"].first["spec"]["progressDeadlineSeconds"] = 25
       f["cannot_run.yml"]["Deployment"].first["spec"]["replicas"] = 1
     end
     assert_deploy_failure(result)
 
-    bad_probe_timeout = if kube_server_version < Gem::Version.new("1.10.0")
-      "Deployment/bad-probe: TIMED OUT (timeout: 5s)"
-    else
-      "Deployment/bad-probe: TIMED OUT (progress deadline: 5s)"
-    end
+    bad_probe_timeout = "Deployment/bad-probe: TIMED OUT (progress deadline: 5s)"
 
     assert_logs_match_all([
       "Successfully deployed 1 resource, timed out waiting for 2 resources to deploy, and failed to deploy 1 resource",
@@ -996,7 +1289,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "ConfigMap/test",
       "Deployment/cannot-run: FAILED",
       bad_probe_timeout,
-      "Deployment/missing-volumes: GLOBAL WATCH TIMEOUT (20 seconds)"
+      "Deployment/missing-volumes: GLOBAL WATCH TIMEOUT (20 seconds)",
     ])
   end
 
@@ -1014,7 +1307,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Successful resources",
       "Service/multi-replica",
       "Deployment/undying: GLOBAL WATCH TIMEOUT (5 seconds)",
-      "If you expected it to take longer than 5 seconds for your deploy to roll out, increase --max-watch-seconds."
+      "If you expected it to take longer than 5 seconds for your deploy to roll out, increase --max-watch-seconds.",
     ], in_order: true)
   end
 
@@ -1025,7 +1318,7 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
       "Invalid template: wrong-extension-erb.yml",
       "Template is not a valid Kubernetes manifest",
       "> Template content:",
-      "<% (0..2).each do |n| %>"
+      "<% (0..2).each do |n| %>",
     ], in_order: true)
   end
 
@@ -1035,34 +1328,12 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_logs_match_all([
       "Invalid template: missing_kind.yml",
       "> Error message:",
-      "Template missing 'Kind'",
+      "Template is missing required field 'kind'",
       "> Template content:",
-      "---",
       "apiVersion: v1",
-      "metadata:",
-      "  name: test",
-      "data:",
-      "  datapoint: value1"
+      "kind: <missing>",
+      'metadata: {"name"=>"test"}',
     ], in_order: true)
-  end
-
-  def test_hpa_can_be_successful
-    skip if kube_server_version < Gem::Version.new('1.9.0')
-    assert_deploy_success(deploy_fixtures("hpa"))
-    assert_logs_match_all([
-      "Deploying resources:",
-      "HorizontalPodAutoscaler/hello-hpa (timeout: 180s)",
-      %r{HorizontalPodAutoscaler/hello-hpa\s+Configured}
-    ])
-  end
-
-  def test_hpa_can_be_pruned
-    skip if kube_server_version < Gem::Version.new('1.9.0')
-    assert_deploy_success(deploy_fixtures("hpa"))
-    assert_deploy_success(deploy_fixtures("hpa", subset: ["deployment.yml"]))
-    assert_logs_match_all([
-      /The following resources were pruned: #{prune_matcher("horizontalpodautoscaler", "autoscaling", "hello-hpa")}/
-    ])
   end
 
   def test_not_apply_resource_can_be_pruned
@@ -1070,8 +1341,230 @@ unknown field \"myKey\" in io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
     assert_deploy_success(deploy_fixtures("hello-cloud", subset: %w(disruption-budgets.yml configmap-data.yml)))
     assert_deploy_success(deploy_fixtures("hello-cloud", subset: %w(configmap-data.yml)))
     assert_logs_match_all([
-      /The following resources were pruned: #{pod_disruption_budget_matcher}/
+      /The following resources were pruned: #{pod_disruption_budget_matcher}/,
     ])
+  end
+
+  def test_no_revision
+    result = deploy_fixtures('hello-cloud', subset: ["configmap-data.yml"], sha: nil)
+    assert_deploy_success(result)
+  end
+
+  def test_network_policies_are_deployed_first
+    deploy_fixtures('hello-cloud', subset: ['network_policy.yml'])
+    assert_logs_match_all([
+      "Predeploying priority resources",
+      "Deploying NetworkPolicy/allow-all-network-policy (timeout: 30s)",
+      "Successfully deployed 1 resource",
+      "Successful resources",
+      "NetworkPolicy/allow-all-network-policy",
+    ], in_order: true)
+  end
+
+  def test_apply_failure_with_sensitive_resources_hides_raw_output
+    logger.level = 0
+    # An invalid PATCH produces the kind of error we want to catch, so first create a valid secret:
+    assert_deploy_success(deploy_fixtures("hello-cloud", subset: %w(secret.yml)))
+    # Then try to PATCH an immutable field
+    result = deploy_fixtures("hello-cloud", subset: %w(secret.yml)) do |fixtures|
+      secret = fixtures["secret.yml"]["Secret"].first
+      secret["type"] = "something/invalid"
+    end
+    assert_deploy_failure(result)
+    refute_logs_match(%r{Kubectl err:.*something/invalid})
+    assert_logs_match_all([
+      "Command failed: apply -f",
+      /WARNING:.*The raw output may be sensitive and so cannot be displayed/,
+    ])
+  end
+
+  def test_validation_failure_on_sensitive_resources_does_not_print_template
+    selector = KubernetesDeploy::LabelSelector.parse("branch=master")
+    assert_deploy_failure(deploy_fixtures("hello-cloud", subset: %w(secret.yml), selector: selector))
+    assert_logs_match_all([
+      "Template validation failed",
+      "Invalid template: Secret-hello-secret",
+      "selector branch=master passed in, but no labels were defined",
+    ], in_order: true)
+    refute_logs_match("password")
+    refute_logs_match("YWRtaW4=")
+  end
+
+  def test_render_failure_on_sensitive_resource_does_not_print_template
+    assert_deploy_failure(deploy_fixtures("invalid-resources", subset: %w(bad_binding_secret.yml.erb)))
+    assert_logs_match_all([
+      "Failed to render and parse template",
+      "Invalid template: bad_binding_secret.yml.erb",
+      "undefined local variable or method",
+      "Template content: Suppressed because it may contain a Secret",
+    ], in_order: true)
+    refute_logs_match("password")
+    refute_logs_match("YWRtaW4=")
+  end
+
+  def test_missing_name_on_secret_does_not_print_template_at_all
+    result = deploy_fixtures("hello-cloud", subset: %w(secret.yml)) do |fixtures|
+      secret = fixtures["secret.yml"]["Secret"].first
+      secret["metadata"].delete("name")
+    end
+    assert_deploy_failure(result)
+
+    assert_logs_match_all([
+      "Invalid template: secret.yml",
+      "Template is missing required field 'metadata.name'",
+      "Template content: Suppressed because it may contain a Secret",
+    ], in_order: true)
+
+    refute_logs_match("apiVersion:")
+    refute_logs_match("password")
+    refute_logs_match("YWRtaW4=")
+  end
+
+  def test_missing_name_on_unknown_resource_prints_metadata_but_not_body
+    result = deploy_fixtures("hello-cloud", subset: %w(secret.yml)) do |fixtures|
+      secret = fixtures["secret.yml"]["Secret"].first
+      secret["metadata"].delete("name")
+      secret["kind"] = "SpecialSecret"
+      secret["metadata"]["labels"] = { "should_appear" => true }
+    end
+    assert_deploy_failure(result)
+
+    assert_logs_match_all([
+      "Invalid template: secret.yml",
+      "Template is missing required field 'metadata.name'",
+      "apiVersion: v1",
+      "kind: SpecialSecret",
+      'metadata: {"labels"=>{"should_appear"=>true}}',
+      "<Template body suppressed because content sensitivity could not be determined.>",
+    ], in_order: true)
+
+    refute_logs_match("password")
+    refute_logs_match("YWRtaW4=")
+  end
+
+  # Note: These tests assume a default storage class with a dynamic provisioner and 'Immediate' bind
+  def test_pvc
+    pvname = "local0001"
+    storage_class_name = "k8s-deploy-test"
+
+    assert_deploy_success(deploy_fixtures("pvc", subset: ["wait_for_first_consumer_storage_class.yml"]))
+
+    TestProvisioner.prepare_pv(pvname, storage_class_name: storage_class_name)
+    assert_deploy_success(deploy_fixtures("pvc"))
+
+    assert_logs_match_all([
+      "Successfully deployed 4 resource",
+      "Successful resources",
+      %r{PersistentVolumeClaim/with-storage-class\s+Bound},
+      %r{PersistentVolumeClaim/without-storage-class\s+Bound},
+      %r{Pod/pvc\s+Succeeded},
+      %r{StorageClass/k8s-deploy-test\s+Exists},
+    ], in_order: true)
+
+  ensure
+    kubeclient.delete_persistent_volume(pvname)
+    storage_v1_kubeclient.delete_storage_class(storage_class_name)
+  end
+
+  def test_pvc_no_bind
+    pvname = "local0002"
+    storage_class_name = "k8s-deploy-test-no-bind"
+
+    result = deploy_fixtures("pvc", subset: ["wait_for_first_consumer_storage_class.yml"]) do |fixtures|
+      sc = fixtures["wait_for_first_consumer_storage_class.yml"]["StorageClass"].first
+      sc["metadata"]["name"] = storage_class_name
+    end
+    assert_deploy_success(result)
+
+    TestProvisioner.prepare_pv(pvname, storage_class_name: storage_class_name)
+    result = deploy_fixtures("pvc", subset: ["pvc.yml"]) do |fixtures|
+      pvc = fixtures["pvc.yml"]["PersistentVolumeClaim"].first
+      pvc["spec"]["storageClassName"] = storage_class_name
+    end
+    assert_deploy_success(result)
+
+    assert_logs_match_all([
+      "Successfully deployed 2 resource",
+      "Successful resources",
+      %r{PersistentVolumeClaim/with-storage-class\s+Pending},
+      %r{PersistentVolumeClaim/without-storage-class\s+Bound},
+    ], in_order: true)
+
+  ensure
+    kubeclient.delete_persistent_volume(pvname)
+    storage_v1_kubeclient.delete_storage_class(storage_class_name)
+  end
+
+  def test_pvc_immediate_bind
+    pvname = "local0003"
+    storage_class_name = "k8s-deploy-test-immediate-bind"
+
+    result = deploy_fixtures("pvc", subset: ["wait_for_first_consumer_storage_class.yml"]) do |fixtures|
+      sc = fixtures["wait_for_first_consumer_storage_class.yml"]["StorageClass"].first
+      sc["metadata"]["name"] = storage_class_name
+      sc["volumeBindingMode"] = "Immediate"
+    end
+    assert_deploy_success(result)
+
+    TestProvisioner.prepare_pv(pvname, storage_class_name: storage_class_name)
+    result = deploy_fixtures("pvc", subset: ["pvc.yml"]) do |fixtures|
+      pvc = fixtures["pvc.yml"]["PersistentVolumeClaim"].first
+      pvc["spec"]["storageClassName"] = storage_class_name
+    end
+    assert_deploy_success(result)
+
+    assert_logs_match_all([
+      "Successfully deployed 2 resource",
+      "Successful resources",
+      %r{PersistentVolumeClaim/with-storage-class\s+Bound},
+      %r{PersistentVolumeClaim/without-storage-class\s+Bound},
+    ], in_order: true)
+
+  ensure
+    kubeclient.delete_persistent_volume(pvname)
+    storage_v1_kubeclient.delete_storage_class(storage_class_name)
+  end
+
+  def test_pvc_no_pv
+    storage_class_name = "k8s-deploy-test-no-pv"
+
+    result = deploy_fixtures("pvc", subset: ["wait_for_first_consumer_storage_class.yml"]) do |fixtures|
+      sc = fixtures["wait_for_first_consumer_storage_class.yml"]["StorageClass"].first
+      sc["metadata"]["name"] = storage_class_name
+    end
+    assert_deploy_success(result)
+
+    result = deploy_fixtures("pvc", subset: ["pvc.yml", "pod.yml"]) do |fixtures|
+      pvc = fixtures["pvc.yml"]["PersistentVolumeClaim"].first
+      pvc["spec"]["storageClassName"] = storage_class_name
+    end
+    assert_deploy_failure(result)
+
+    assert_logs_match_all([
+      "Failed to deploy 1 priority resource",
+      "Pod/pvc: TIMED OUT (timeout: 10s)",
+      %r{Pod could not be scheduled because 0/\d+ nodes are available:},
+      /\d+ node[(]s[)] didn't find available persistent volumes to bind./,
+    ], in_order: true)
+
+  ensure
+    storage_v1_kubeclient.delete_storage_class(storage_class_name)
+  end
+
+  def test_pvc_no_pv_or_sc
+    storage_class_name = "k8s-deploy-test-no-pv-or-sc"
+
+    result = deploy_fixtures("pvc", subset: ["pvc.yml", "pod.yml"]) do |fixtures|
+      pvc = fixtures["pvc.yml"]["PersistentVolumeClaim"].first
+      pvc["spec"]["storageClassName"] = storage_class_name
+    end
+    assert_deploy_failure(result)
+
+    assert_logs_match_all([
+      "Failed to deploy 1 priority resource",
+      "PersistentVolumeClaim/with-storage-class: TIMED OUT (timeout: 10s)",
+      "PVC specified a StorageClass of #{storage_class_name} but the resource does not exist",
+    ], in_order: true)
   end
 
   private

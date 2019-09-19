@@ -23,11 +23,11 @@ module KubernetesDeploy
 
   class DeploymentTimeoutError < FatalDeploymentError; end
 
-  module Errors
-    extend self
-    def server_version_warning(server_version)
-      "Minimum cluster version requirement of #{MIN_KUBE_VERSION} not met. "\
-      "Using #{server_version} could result in unexpected behavior as it is no longer tested against"
+  class EjsonPrunableError < FatalDeploymentError
+    def initialize
+      super("Found #{KubernetesResource::LAST_APPLIED_ANNOTATION} annotation on " \
+          "#{EjsonSecretProvisioner::EJSON_KEYS_SECRET} secret. " \
+          "kubernetes-deploy will not continue since it is extremely unlikely that this secret should be pruned.")
     end
   end
 end

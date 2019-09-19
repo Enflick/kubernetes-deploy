@@ -1,4 +1,6 @@
 # frozen_string_literal: true
+require 'kubernetes-deploy/kubernetes_resource/pod'
+
 module KubernetesDeploy
   class Service < KubernetesResource
     TIMEOUT = 7.minutes
@@ -6,17 +8,19 @@ module KubernetesDeploy
     def sync(cache)
       super
       if exists? && selector.present?
-        @related_deployments = cache.get_all(Deployment.kind, selector)
         @related_pods = cache.get_all(Pod.kind, selector)
+        @related_workloads = fetch_related_workloads(cache)
       else
-        @related_deployments = []
         @related_pods = []
+        @related_workloads = []
       end
     end
 
     def status
       if !exists?
         "Not found"
+      elsif requires_publishing? && !published?
+        "LoadBalancer IP address is not provisioned yet"
       elsif !requires_endpoints?
         "Doesn't require any endpoints"
       elsif selects_some_pods?
@@ -28,9 +32,10 @@ module KubernetesDeploy
 
     def deploy_succeeded?
       return false unless exists?
+      return published? if requires_publishing?
       return exists? unless requires_endpoints?
       # We can't use endpoints if we want the service to be able to fail fast when the pods are down
-      exposes_zero_replica_deployment? || selects_some_pods?
+      exposes_zero_replica_workload? || selects_some_pods?
     end
 
     def deploy_failed?
@@ -38,18 +43,27 @@ module KubernetesDeploy
     end
 
     def timeout_message
-      "This service does not seem to select any pods. This means its spec.selector is probably incorrect."
+      "This service does not seem to select any pods and this is likely invalid. "\
+      "Please confirm the spec.selector is correct and the targeted workload is healthy."
     end
 
     private
 
-    def exposes_zero_replica_deployment?
+    def fetch_related_workloads(cache)
+      related_deployments = cache.get_all(Deployment.kind)
+      related_statefulsets = cache.get_all(StatefulSet.kind)
+      (related_deployments + related_statefulsets).select do |workload|
+        selector.all? { |k, v| workload['spec']['template']['metadata']['labels'][k] == v }
+      end
+    end
+
+    def exposes_zero_replica_workload?
       return false unless related_replica_count
       related_replica_count == 0
     end
 
     def requires_endpoints?
-      # service of type External don't have endpoints
+      # services of type External don't have endpoints
       return false if external_name_svc?
 
       # problem counting replicas - by default, assume endpoints are required
@@ -69,12 +83,22 @@ module KubernetesDeploy
 
     def related_replica_count
       return 0 unless selector.present?
-      return unless @related_deployments.length == 1
-      @related_deployments.first["spec"]["replicas"].to_i
+
+      if @related_workloads.present?
+        @related_workloads.inject(0) { |sum, d| sum + d["spec"]["replicas"].to_i }
+      end
     end
 
     def external_name_svc?
       @definition["spec"]["type"] == "ExternalName"
+    end
+
+    def requires_publishing?
+      @definition["spec"]["type"] == "LoadBalancer"
+    end
+
+    def published?
+      @instance_data.dig('status', 'loadBalancer', 'ingress').present?
     end
   end
 end
