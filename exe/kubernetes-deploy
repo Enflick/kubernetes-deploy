@@ -1,32 +1,45 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require 'kubernetes-deploy'
+require 'kubernetes-deploy/deploy_task'
+require 'kubernetes-deploy/options_helper'
+require 'kubernetes-deploy/bindings_parser'
+require 'kubernetes-deploy/label_selector'
+
 require 'optparse'
 
 skip_wait = false
-template_dir = nil
+template_dir = nil # deprecated
+template_paths = []
 allow_protected_ns = false
 prune = false
 bindings = {}
 verbose_log_prefix = false
 max_watch_seconds = nil
+selector = nil
 
 ARGV.options do |opts|
+  parser = KubernetesDeploy::BindingsParser.new
   opts.on("--bindings=BINDINGS", "Expose additional variables to ERB templates " \
-    "(format: k1=v1,k2=v2, JSON string or file (JSON or YAML) path prefixed by '@')") do |binds|
-    bindings.merge!(KubernetesDeploy::BindingsParser.parse(binds))
-  end
+    "(format: k1=v1,k2=v2, JSON string or file (JSON or YAML) path prefixed by '@')") { |b| parser.add(b) }
 
   opts.on("--skip-wait", "Skip verification of non-priority-resource success (not recommended)") { skip_wait = true }
   prot_ns = KubernetesDeploy::DeployTask::PROTECTED_NAMESPACES.join(', ')
   opts.on("--allow-protected-ns", "Enable deploys to #{prot_ns}") { allow_protected_ns = true }
   opts.on("--prune", "Delete resources that do not appear in the template dir") { prune = true }
   opts.on("--template-dir=DIR", "Set the template dir (default: config/deploy/$ENVIRONMENT)") { |v| template_dir = v }
+  opts.on("-f [PATHS]", Array, "comma separated list of template directories and/or filenames") do |paths|
+    template_paths += paths
+  end
+
   opts.on("--verbose-log-prefix", "Add [context][namespace] to the log prefix") { verbose_log_prefix = true }
   opts.on("--max-watch-seconds=seconds",
     "Timeout error is raised if it takes longer than the specified number of seconds") do |t|
     max_watch_seconds = t.to_i
+  end
+  opts.on("--selector=SELECTOR", "Ensure that all resources in your template dir match the given selector, " \
+    "and restrict pruning to deployed resources it selects.  (format: k1=v1,k2=v2)") do |s|
+    selector = KubernetesDeploy::LabelSelector.parse(s)
   end
 
   opts.on_tail("-h", "--help", "Print this help") do
@@ -38,6 +51,7 @@ ARGV.options do |opts|
     exit
   end
   opts.parse!
+  bindings = parser.parse
 end
 
 namespace = ARGV[0]
@@ -46,24 +60,37 @@ template_dir = KubernetesDeploy::OptionsHelper.default_and_check_template_dir(te
 revision = KubernetesDeploy::OptionsHelper.revision_from_environment
 logger = KubernetesDeploy::FormattedLogger.build(namespace, context, verbose_prefix: verbose_log_prefix)
 
-runner = KubernetesDeploy::DeployTask.new(
-  namespace: namespace,
-  context: context,
-  current_sha: revision,
-  template_dir: template_dir,
-  bindings: bindings,
-  logger: logger,
-  max_watch_seconds: max_watch_seconds
-)
+# Deprecation path: this can be removed when --template-dir is fully replaced by -f
+if template_dir && !template_paths.empty?
+  logger.error("Error: --template-dir and -f flags cannot be combined")
+  exit(1)
+end
+template_paths = [template_dir] if template_paths.empty? && template_dir
 
 begin
-  runner.run!(
-    verify_result: !skip_wait,
-    allow_protected_ns: allow_protected_ns,
-    prune: prune
-  )
+  KubernetesDeploy::OptionsHelper.with_processed_template_paths(template_paths) do |paths|
+    runner = KubernetesDeploy::DeployTask.new(
+      namespace: namespace,
+      context: context,
+      current_sha: ENV["REVISION"],
+      template_paths: paths,
+      bindings: bindings,
+      logger: logger,
+      max_watch_seconds: max_watch_seconds,
+      selector: selector,
+    )
+
+    runner.run!(
+      verify_result: !skip_wait,
+      allow_protected_ns: allow_protected_ns,
+      prune: prune
+    )
+  end
 rescue KubernetesDeploy::DeploymentTimeoutError
-  exit 70
+  exit(70)
 rescue KubernetesDeploy::FatalDeploymentError
-  exit 1
+  exit(1)
+rescue KubernetesDeploy::OptionsHelper::OptionsError => e
+  logger.error(e.message)
+  exit(1)
 end

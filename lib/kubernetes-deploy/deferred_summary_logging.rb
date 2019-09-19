@@ -1,4 +1,6 @@
 # frozen_string_literal: true
+require 'colorized_string'
+
 module KubernetesDeploy
   # Adds the methods kubernetes-deploy requires to your logger class.
   # These methods include helpers for logging consistent headings, as well as facilities for
@@ -47,7 +49,7 @@ module KubernetesDeploy
         level = :fatal
       end
 
-      if actions_sentence = summary.actions_sentence.presence
+      if (actions_sentence = summary.actions_sentence.presence)
         public_send(level, actions_sentence)
         blank_line(level)
       end

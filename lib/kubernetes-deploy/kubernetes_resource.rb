@@ -1,9 +1,11 @@
 # frozen_string_literal: true
 require 'json'
-require 'open3'
 require 'shellwords'
 
 require 'kubernetes-deploy/remote_logs'
+require 'kubernetes-deploy/duration_parser'
+require 'kubernetes-deploy/label_selector'
+require 'kubernetes-deploy/rollout_conditions'
 
 module KubernetesDeploy
   class KubernetesResource
@@ -28,22 +30,35 @@ module KubernetesDeploy
       If you have reason to believe it will succeed, retry the deploy to continue to monitor the rollout.
       MSG
 
-    TIMEOUT_OVERRIDE_ANNOTATION = "kubernetes-deploy.shopify.io/timeout-override"
+    TIMEOUT_OVERRIDE_ANNOTATION_SUFFIX = "timeout-override"
+    TIMEOUT_OVERRIDE_ANNOTATION_DEPRECATED = "kubernetes-deploy.shopify.io/#{TIMEOUT_OVERRIDE_ANNOTATION_SUFFIX}"
+    TIMEOUT_OVERRIDE_ANNOTATION = "krane.shopify.io/#{TIMEOUT_OVERRIDE_ANNOTATION_SUFFIX}"
+    LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration"
+    SENSITIVE_TEMPLATE_CONTENT = false
 
     class << self
-      def build(namespace:, context:, definition:, logger:, statsd_tags:)
+      def build(namespace:, context:, definition:, logger:, statsd_tags:, crd: nil)
+        validate_definition_essentials(definition)
         opts = { namespace: namespace, context: context, definition: definition, logger: logger,
                  statsd_tags: statsd_tags }
-        if definition["kind"].blank?
-          raise InvalidTemplateError.new("Template missing 'Kind'", content: definition.to_yaml)
-        elsif KubernetesDeploy.const_defined?(definition["kind"])
-          klass = KubernetesDeploy.const_get(definition["kind"])
-          klass.new(**opts)
+        if (klass = class_for_kind(definition["kind"]))
+          return klass.new(**opts)
+        end
+        if crd
+          CustomResource.new(crd: crd, **opts)
         else
           inst = new(**opts)
           inst.type = definition["kind"]
           inst
         end
+      end
+
+      def class_for_kind(kind)
+        if KubernetesDeploy.const_defined?(kind)
+          KubernetesDeploy.const_get(kind)
+        end
+      rescue NameError
+        nil
       end
 
       def timeout
@@ -52,6 +67,24 @@ module KubernetesDeploy
 
       def kind
         name.demodulize
+      end
+
+      private
+
+      def validate_definition_essentials(definition)
+        debug_content = <<~STRING
+          apiVersion: #{definition.fetch('apiVersion', '<missing>')}
+          kind: #{definition.fetch('kind', '<missing>')}
+          metadata: #{definition.fetch('metadata', {})}
+          <Template body suppressed because content sensitivity could not be determined.>
+        STRING
+        if definition["kind"].blank?
+          raise InvalidTemplateError.new("Template is missing required field 'kind'", content: debug_content)
+        end
+
+        if definition.dig('metadata', 'name').blank?
+          raise InvalidTemplateError.new("Template is missing required field 'metadata.name'", content: debug_content)
+        end
       end
     end
 
@@ -62,7 +95,8 @@ module KubernetesDeploy
 
     def timeout_override
       return @timeout_override if defined?(@timeout_override)
-      @timeout_override = DurationParser.new(timeout_annotation).parse!.to_i
+
+      @timeout_override = DurationParser.new(krane_annotation_value(TIMEOUT_OVERRIDE_ANNOTATION_SUFFIX)).parse!.to_i
     rescue DurationParser::ParsingError
       @timeout_override = nil
     end
@@ -73,12 +107,7 @@ module KubernetesDeploy
 
     def initialize(namespace:, context:, definition:, logger:, statsd_tags: [])
       # subclasses must also set these if they define their own initializer
-      @name = definition.dig("metadata", "name")
-      unless @name.present?
-        logger.summary.add_paragraph("Rendered template content:\n#{definition.to_yaml}")
-        raise FatalDeploymentError, "Template is missing required field metadata.name"
-      end
-
+      @name = definition.dig("metadata", "name").to_s
       @optional_statsd_tags = statsd_tags
       @namespace = namespace
       @context = context
@@ -87,6 +116,7 @@ module KubernetesDeploy
       @statsd_report_done = false
       @disappeared = false
       @validation_errors = []
+      @validation_warnings = []
       @instance_data = {}
     end
 
@@ -94,15 +124,22 @@ module KubernetesDeploy
       Kubeclient::Resource.new(@definition)
     end
 
-    def validate_definition(kubectl)
+    def validate_definition(kubectl, selector: nil)
       @validation_errors = []
+      @validation_warnings = []
+      validate_selector(selector) if selector
       validate_timeout_annotation
+      validate_annotation_version
+      validate_spec_with_kubectl(kubectl)
+      @validation_errors.present?
+    end
 
-      command = ["create", "-f", file_path, "--dry-run", "--output=name"]
-      _, err, st = kubectl.run(*command, log_failure: false)
-      return true if st.success?
-      @validation_errors << err
-      false
+    def validation_warning_msg
+      @validation_warnings.join("\n")
+    end
+
+    def has_warnings?
+      @validation_warnings.present?
     end
 
     def validation_error_msg
@@ -115,6 +152,10 @@ module KubernetesDeploy
 
     def id
       "#{type}/#{name}"
+    end
+
+    def <=>(other)
+      id <=> other.id
     end
 
     def file_path
@@ -162,17 +203,17 @@ module KubernetesDeploy
 
     def current_generation
       return -1 unless exists? # must be different default than observed_generation
-      @instance_data["metadata"]["generation"]
+      @instance_data.dig("metadata", "generation")
     end
 
     def observed_generation
       return -2 unless exists?
       # populating this is a best practice, but not all controllers actually do it
-      @instance_data["status"]["observedGeneration"]
+      @instance_data.dig('status', 'observedGeneration')
     end
 
     def status
-      exists? ? "Exists" : "Unknown"
+      exists? ? "Exists" : "Not Found"
     end
 
     def type
@@ -298,6 +339,10 @@ module KubernetesDeploy
       end
     end
 
+    def sensitive_template_content?
+      self.class::SENSITIVE_TEMPLATE_CONTENT
+    end
+
     class Event
       EVENT_SEPARATOR = "ENDEVENT--BEGINEVENT"
       FIELD_SEPARATOR = "ENDFIELD--BEGINFIELD"
@@ -319,7 +364,7 @@ module KubernetesDeploy
           '(ne .reason "SuccessfulCreate")',
           '(ne .reason "Scheduled")',
           '(ne .reason "Pulling")',
-          '(ne .reason "Pulled")'
+          '(ne .reason "Pulled")',
         ]
         condition_start = "{{if and #{and_conditions.join(' ')}}}"
         field_part = FIELDS.map { |f| "{{#{f}}}" }.join(%({{print "#{FIELD_SEPARATOR}"}}))
@@ -365,20 +410,74 @@ module KubernetesDeploy
     private
 
     def validate_timeout_annotation
-      return if timeout_annotation.nil?
+      timeout_override_value = krane_annotation_value(TIMEOUT_OVERRIDE_ANNOTATION_SUFFIX)
+      timeout_annotation_key = krane_annotation_key(TIMEOUT_OVERRIDE_ANNOTATION_SUFFIX)
+      return if timeout_override_value.nil?
 
-      override = DurationParser.new(timeout_annotation).parse!
+      override = DurationParser.new(timeout_override_value).parse!
       if override <= 0
-        @validation_errors << "#{TIMEOUT_OVERRIDE_ANNOTATION} annotation is invalid: Value must be greater than 0"
+        @validation_errors << "#{timeout_annotation_key} annotation is invalid: Value must be greater than 0"
       elsif override > 24.hours
-        @validation_errors << "#{TIMEOUT_OVERRIDE_ANNOTATION} annotation is invalid: Value must be less than 24h"
+        @validation_errors << "#{timeout_annotation_key} annotation is invalid: Value must be less than 24h"
       end
     rescue DurationParser::ParsingError => e
-      @validation_errors << "#{TIMEOUT_OVERRIDE_ANNOTATION} annotation is invalid: #{e}"
+      @validation_errors << "#{timeout_annotation_key} annotation is invalid: #{e}"
     end
 
-    def timeout_annotation
-      @definition.dig("metadata", "annotations", TIMEOUT_OVERRIDE_ANNOTATION)
+    def validate_annotation_version
+      return if validation_warning_msg.include?("annotations is deprecated")
+      annotation_keys = @definition.dig("metadata", "annotations")&.keys
+      annotation_keys&.each do |annotation|
+        if annotation.include?("kubernetes-deploy.shopify.io")
+          annotation_prefix = annotation.split('/').first
+          @validation_warnings << "#{annotation_prefix} as a prefix for annotations is deprecated: "\
+            "Use the 'krane.shopify.io' annotation prefix instead"
+          return
+        end
+      end
+    end
+
+    def krane_annotation_value(suffix)
+      @definition.dig("metadata", "annotations", "kubernetes-deploy.shopify.io/#{suffix}") ||
+        @definition.dig("metadata", "annotations", "krane.shopify.io/#{suffix}")
+    end
+
+    def krane_annotation_key(suffix)
+      if @definition.dig("metadata", "annotations", "kubernetes-deploy.shopify.io/#{suffix}")
+        "kubernetes-deploy.shopify.io/#{suffix}"
+      elsif @definition.dig("metadata", "annotations", "krane.shopify.io/#{suffix}")
+        "krane.shopify.io/#{suffix}"
+      end
+    end
+
+    def validate_selector(selector)
+      if labels.nil?
+        @validation_errors << "selector #{selector} passed in, but no labels were defined"
+        return
+      end
+
+      unless selector.to_h <= labels
+        label_name = 'label'.pluralize(labels.size)
+        label_string = LabelSelector.new(labels).to_s
+        @validation_errors << "selector #{selector} does not match #{label_name} #{label_string}"
+      end
+    end
+
+    def validate_spec_with_kubectl(kubectl)
+      command = ["create", "-f", file_path, "--dry-run", "--output=name"]
+      _, err, st = kubectl.run(*command, log_failure: false, output_is_sensitive: sensitive_template_content?,
+        retry_whitelist: [:client_timeout], attempts: 3)
+
+      return true if st.success?
+      @validation_errors << if sensitive_template_content?
+        "Validation for #{id} failed. Detailed information is unavailable as the raw error may contain sensitive data."
+      else
+        err
+      end
+    end
+
+    def labels
+      @definition.dig("metadata", "labels")
     end
 
     def file

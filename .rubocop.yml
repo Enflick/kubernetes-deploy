@@ -4,16 +4,14 @@ inherit_from:
 AllCops:
   TargetRubyVersion: 2.3
 
-Style/TrailingCommaInArrayLiteral:
-  Enabled: false
-
-Style/TrailingCommaInHashLiteral:
-  Enabled: false
-
-Style/MethodCallWithArgsParentheses:
-  Enabled: false
-
 Naming/FileName:
   Enabled: true
   Exclude:
     - lib/kubernetes-deploy.rb
+
+Sorbet/ConstantsFromStrings:
+  Enabled: false
+
+Layout/Tab:
+  Exclude:
+    - test/integration/kubernetes_deploy_test.rb

@@ -8,10 +8,9 @@ class TestProvisioner
   class << self
     def prepare_cluster
       WebMock.allow_net_connect!
-      $stderr.print "Preparing test cluster... "
+      $stderr.print("Preparing test cluster... ")
       prepare_pv("pv0001")
       prepare_pv("pv0002")
-      deploy_metric_server
       $stderr.puts "Done."
       WebMock.disable_net_connect!
     end
@@ -29,7 +28,27 @@ class TestProvisioner
     def delete_namespace(namespace)
       kubeclient.delete_namespace(namespace) if namespace.present?
     rescue KubeException => e
-      raise unless e.to_s.include?("not found")
+      raise unless e.is_a?(Kubeclient::ResourceNotFoundError)
+    end
+
+    def prepare_pv(name, storage_class_name: nil)
+      existing_pvs = kubeclient.get_persistent_volumes(label_selector: "name=#{name}")
+      return if existing_pvs.present?
+
+      pv = Kubeclient::Resource.new(kind: 'PersistentVolume')
+      pv.metadata = {
+        name: name,
+        labels: { name: name },
+      }
+      pv.spec = {
+        accessModes: %w(ReadWriteOnce),
+        capacity: { storage: "150Mi" },
+        hostPath: { path: "/data/#{name}" },
+        persistentVolumeReclaimPolicy: "Recycle",
+      }
+      pv.spec[:storageClassName] = storage_class_name if storage_class_name.present?
+
+      kubeclient.create_persistent_volume(pv)
     end
 
     private
@@ -38,36 +57,6 @@ class TestProvisioner
       ns = Kubeclient::Resource.new(kind: 'Namespace')
       ns.metadata = { name: namespace }
       kubeclient.create_namespace(ns)
-    end
-
-    def prepare_pv(name)
-      existing_pvs = kubeclient.get_persistent_volumes(label_selector: "name=#{name}")
-      return if existing_pvs.present?
-
-      pv = Kubeclient::Resource.new(kind: 'PersistentVolume')
-      pv.metadata = {
-        name: name,
-        labels: { name: name }
-      }
-      pv.spec = {
-        accessModes: %w(ReadWriteOnce),
-        capacity: { storage: "150Mi" },
-        hostPath: { path: "/data/#{name}" },
-        persistentVolumeReclaimPolicy: "Recycle"
-      }
-      kubeclient.create_persistent_volume(pv)
-    end
-
-    def deploy_metric_server
-      # Set-up the metric server that the HPA needs https://github.com/kubernetes-incubator/metrics-server
-      logger = KubernetesDeploy::FormattedLogger.build("default", KubeclientHelper::TEST_CONTEXT, $stderr)
-      kubectl = KubernetesDeploy::Kubectl.new(namespace: "kube-system", context: KubeclientHelper::TEST_CONTEXT,
-        logger: logger, log_failure_by_default: true, default_timeout: '5s')
-
-      Dir.glob("test/setup/metrics-server/*.{yml,yaml}*").map do |resource|
-        found = kubectl.run("get", "-f", resource, log_failure: false).last.success?
-        kubectl.run("create", "-f", resource) unless found
-      end
     end
   end
 end

@@ -1,8 +1,12 @@
 # frozen_string_literal: true
+require 'kubernetes-deploy/kubernetes_resource/replica_set'
+
 module KubernetesDeploy
   class Deployment < KubernetesResource
     TIMEOUT = 7.minutes
-    REQUIRED_ROLLOUT_ANNOTATION = 'kubernetes-deploy.shopify.io/required-rollout'
+    REQUIRED_ROLLOUT_ANNOTATION_SUFFIX = "required-rollout"
+    REQUIRED_ROLLOUT_ANNOTATION_DEPRECATED = "kubernetes-deploy.shopify.io/#{REQUIRED_ROLLOUT_ANNOTATION_SUFFIX}"
+    REQUIRED_ROLLOUT_ANNOTATION = "krane.shopify.io/#{REQUIRED_ROLLOUT_ANNOTATION_SUFFIX}"
     REQUIRED_ROLLOUT_TYPES = %w(maxUnavailable full none).freeze
     DEFAULT_REQUIRED_ROLLOUT = 'full'
 
@@ -63,7 +67,9 @@ module KubernetesDeploy
     end
 
     def timeout_message
-      reason_msg = if progress_condition.present?
+      reason_msg = if timeout_override
+        STANDARD_TIMEOUT_MESSAGE
+      elsif progress_condition.present?
         "Timeout reason: #{progress_condition['reason']}"
       else
         "Timeout reason: hard deadline for #{type}"
@@ -73,16 +79,24 @@ module KubernetesDeploy
     end
 
     def pretty_timeout_type
-      progress_deadline.present? ? "progress deadline: #{progress_deadline}s" : super
+      if timeout_override
+        "timeout override: #{timeout_override}s"
+      elsif progress_deadline.present?
+        "progress deadline: #{progress_deadline}s"
+      else
+        super
+      end
     end
 
     def deploy_timed_out?
       return false if deploy_failed?
+      return super if timeout_override
+
       # Do not use the hard timeout if progress deadline is set
       progress_condition.present? ? deploy_failing_to_progress? : super
     end
 
-    def validate_definition(_)
+    def validate_definition(*)
       super
 
       unless REQUIRED_ROLLOUT_TYPES.include?(required_rollout) || percent?(required_rollout)
@@ -91,8 +105,8 @@ module KubernetesDeploy
 
       strategy = @definition.dig('spec', 'strategy', 'type').to_s
       if required_rollout.downcase == 'maxunavailable' && strategy.present? && strategy.downcase != 'rollingupdate'
-        @validation_errors << "'#{REQUIRED_ROLLOUT_ANNOTATION}: #{required_rollout}' is incompatible "\
-        "with strategy '#{strategy}'"
+        @validation_errors << "'#{krane_annotation_key(REQUIRED_ROLLOUT_ANNOTATION_SUFFIX)}: #{required_rollout}' "\
+          "is incompatible with strategy '#{strategy}'"
       end
 
       @validation_errors.empty?
@@ -136,7 +150,7 @@ module KubernetesDeploy
     end
 
     def rollout_annotation_err_msg
-      "'#{REQUIRED_ROLLOUT_ANNOTATION}: #{required_rollout}' is invalid. "\
+      "'#{krane_annotation_key(REQUIRED_ROLLOUT_ANNOTATION_SUFFIX)}: #{required_rollout}' is invalid. "\
         "Acceptable values: #{REQUIRED_ROLLOUT_TYPES.join(', ')}"
     end
 
@@ -189,7 +203,7 @@ module KubernetesDeploy
     end
 
     def required_rollout
-      @definition.dig('metadata', 'annotations', REQUIRED_ROLLOUT_ANNOTATION).presence || DEFAULT_REQUIRED_ROLLOUT
+      krane_annotation_value("required-rollout") || DEFAULT_REQUIRED_ROLLOUT
     end
 
     def percent?(value)

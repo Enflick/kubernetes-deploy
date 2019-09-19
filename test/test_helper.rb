@@ -18,7 +18,8 @@ if ENV["PROFILE"]
   require 'ruby-prof-flamegraph'
 end
 
-$LOAD_PATH.unshift File.expand_path('../../lib', __FILE__)
+$LOAD_PATH.unshift(File.expand_path('../../lib', __FILE__))
+require 'krane'
 require 'kubernetes-deploy'
 require 'kubeclient'
 require 'timecop'
@@ -28,32 +29,31 @@ require 'webmock/minitest'
 require 'mocha/minitest'
 require 'minitest/parallel'
 require "minitest/reporters"
-include StatsD::Instrument::Assertions
+include(StatsD::Instrument::Assertions)
 
 Dir.glob(File.expand_path("../helpers/*.rb", __FILE__)).each { |file| require file }
-ENV["KUBECONFIG"] ||= "#{Dir.home}/.kube/config"
 
 Mocha::Configuration.prevent(:stubbing_method_unnecessarily)
 Mocha::Configuration.prevent(:stubbing_non_existent_method)
 Mocha::Configuration.prevent(:stubbing_non_public_method)
 
 if ENV["PARALLELIZE_ME"]
-  Minitest::Reporters.use! [
+  Minitest::Reporters.use!([
     Minitest::Reporters::ParallelizableReporter.new(
       fast_fail: ENV['VERBOSE'] == '1',
       slow_count: 10,
       detailed_skip: false,
       verbose: ENV['VERBOSE'] == '1'
-    )
-  ]
+    ),
+  ])
 else
-  Minitest::Reporters.use! [
+  Minitest::Reporters.use!([
     Minitest::Reporters::DefaultReporter.new(
       slow_count: 10,
       detailed_skip: false,
       verbose: ENV['VERBOSE'] == '1'
-    )
-  ]
+    ),
+  ])
 end
 
 module KubernetesDeploy
@@ -73,6 +73,7 @@ module KubernetesDeploy
     end
 
     def configure_logger
+      @logger_stream = StringIO.new
       if log_to_real_fds?
         ColorizedString.disable_colorization = false
 
@@ -88,7 +89,6 @@ module KubernetesDeploy
         device = $stderr
       else
         ColorizedString.disable_colorization = true
-        @logger_stream = StringIO.new
         device = @logger_stream
       end
 
@@ -109,7 +109,7 @@ module KubernetesDeploy
     end
 
     def assert_deploy_failure(result, cause = nil)
-      assert_equal false, result, "Deploy succeeded when it was expected to fail.#{logs_message_if_captured}"
+      assert_equal(false, result, "Deploy succeeded when it was expected to fail.#{logs_message_if_captured}")
       logging_assertion do |logs|
         cause_string = cause == :timed_out ? "TIMED OUT" : "FAILURE"
         assert_match Regexp.new("Result: #{cause_string}"), logs,
@@ -120,7 +120,7 @@ module KubernetesDeploy
     alias_method :assert_task_run_failure, :assert_deploy_failure
 
     def assert_deploy_success(result)
-      assert_equal true, result, "Deploy failed when it was expected to succeed.#{logs_message_if_captured}"
+      assert_equal(true, result, "Deploy failed when it was expected to succeed.#{logs_message_if_captured}")
       logging_assertion do |logs|
         assert_match Regexp.new("Result: SUCCESS"), logs, "'Result: SUCCESS' not found in the following logs:\n#{logs}"
       end
@@ -131,7 +131,7 @@ module KubernetesDeploy
     def assert_logs_match(regexp, times = nil)
       logging_assertion do |logs|
         unless times
-          assert_match regexp, logs, "'#{regexp}' not found in the following logs:\n#{logs}"
+          assert_match(regexp, logs, "'#{regexp}' not found in the following logs:\n#{logs}")
           return
         end
 
@@ -148,9 +148,9 @@ module KubernetesDeploy
           regex = entry.is_a?(Regexp) ? entry : Regexp.new(Regexp.escape(entry))
           if in_order
             failure_msg = "'#{entry}' not found in the expected sequence in the following logs:\n#{logs}"
-            assert scanner.scan_until(regex), failure_msg
+            assert(scanner.scan_until(regex), failure_msg)
           else
-            assert regex =~ logs, "'#{entry}' not found in the following logs:\n#{logs}"
+            assert(regex =~ logs, "'#{entry}' not found in the following logs:\n#{logs}")
           end
         end
       end
@@ -176,7 +176,7 @@ module KubernetesDeploy
 
     def assert_raises_message(exception_class, exception_message)
       exception = assert_raises(exception_class) { yield }
-      assert_match exception_message, exception.message
+      assert_match(exception_message, exception.message)
       exception
     end
 
@@ -189,7 +189,7 @@ module KubernetesDeploy
 
     def stub_kubectl_response(*args, kwargs: {}, resp:, err: "", success: true, json: true, times: 1)
       if json
-        args << "--output=json"
+        kwargs[:output] = "json"
         resp = resp.to_json
       end
       response = [resp, err, stub(success?: success)]
@@ -219,6 +219,15 @@ module KubernetesDeploy
       end
     end
 
+    def task_config(context: KubeclientHelper::TEST_CONTEXT, namespace: @namespace, logger: @logger)
+      KubernetesDeploy::TaskConfig.new(context, namespace, logger)
+    end
+
+    def krane_black_box(command, args = "")
+      path = File.expand_path("../../exe/krane", __FILE__)
+      Open3.capture3("#{path} #{command} #{args}")
+    end
+
     private
 
     def log_to_real_fds?
@@ -229,8 +238,15 @@ module KubernetesDeploy
       if log_to_real_fds?
         $stderr.puts("\033[0;33mWARNING: Skipping logging assertions while logs are redirected to stderr\033[0m")
       else
-        @logger_stream.rewind
-        yield @logger_stream.read
+        yield @logger_stream.string
+      end
+    end
+
+    def stdout_assertion
+      if log_to_real_fds?
+        $stderr.puts("\033[0;33mWARNING: Skipping stream assertions while logs are redirected to stderr\033[0m")
+      else
+        yield @mock_output_stream.string
       end
     end
 

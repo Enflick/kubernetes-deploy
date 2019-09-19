@@ -1,3 +1,163 @@
+## next
+
+*Enhancements*
+- Officially support Kubernetes 1.15 ([#546](https://github.com/Shopify/kubernetes-deploy/pull/546))
+- Make sure that we only declare a Service of type LoadBalancer as deployed after its IP address is published. [#547](https://github.com/Shopify/kubernetes-deploy/pull/547)
+- Add more validations to `RunnerTask`. [#554](https://github.com/Shopify/kubernetes-deploy/pull/554)
+
+
+*Bug Fixes*
+- Fix a bug in rendering where we failed to add a yaml doc separator (`---`) to
+  an implicit document if there are multiple documents in the file.
+  ([#551](https://github.com/Shopify/kubernetes-deploy/pull/551))
+
+*Other*
+- Kubernetes 1.10 is no longer officially supported as of this version ([#546](https://github.com/Shopify/kubernetes-deploy/pull/546))
+- We've added a new Krane cli. This code is in alpha. We are providing
+no warranty at this time and reserve the right to make major breaking changes including
+removing it entirely at any time. ([#256](https://github.com/Shopify/kubernetes-deploy/issues/256))
+- Deprecate `kubernetes-deploy.shopify.io` annotations in favour of `krane.shopify.io`.
+
+
+## 0.27.0
+*Enhancements*
+- (alpha) Introduce a new `-f` flag for `kubernetes-deploy`. Allows passing in of multiple directories and/or filenames. Currently only usable by `kubernetes-deploy`, not `kubernetes-render`. [#514](https://github.com/Shopify/kubernetes-deploy/pull/514)
+- Initial implementation of shared task validation objects. [#533](https://github.com/Shopify/kubernetes-deploy/pull/533)
+- Restructure `require`s so that requiring a given task actually gives you the dependencies you need, and doesn't give what you don't need. [#487](https://github.com/Shopify/kubernetes-deploy/pull/487)
+- **[Breaking change]** Added ServiceAccount, PodTemplate, ReplicaSet, Role, and RoleBinding to the prune whitelist.
+  * To see what resources may be affected, run `kubectl get $RESOURCE -o jsonpath='{ range .items[*] }{.metadata.namespace}{ "\t" }{.metadata.name}{ "\t" }{.metadata.annotations}{ "\n" }{ end }' --all-namespaces | grep "last-applied"`
+  * To exclude a resource from kubernetes-deploy (and kubectl apply) management, remove the last-applied annotation `kubectl annotate $RESOURCE $SECRET_NAME kubectl.kubernetes.io/last-applied-configuration-`.
+
+*Bug Fixes*
+- StatefulSets with 0 replicas explicitly specified don't fail deploy. [#540](https://github.com/Shopify/kubernetes-deploy/pull/540)
+- Search all workloads if a Pod selector doesn't match any workloads when deploying a Service. [#541](https://github.com/Shopify/kubernetes-deploy/pull/541)
+
+*Other*
+- `EjsonSecretProvisioner#new` signature has changed. `EjsonSecretProvisioner` objects no longer have access to `kubectl`. Rather, the `ejson-keys` secret used for decryption is now passed in via the calling task. Note that we only consider the `new` and `run(!)` methods of tasks (render, deploy, etc) to have inviolable APIs, so we do not consider this change breaking. [#514](https://github.com/Shopify/kubernetes-deploy/pull/514)
+
+## 0.26.7
+
+*Other*
+- Bump `googleauth` dependency. ([#512](https://github.com/Shopify/kubernetes-deploy/pull/512))
+
+## 0.26.6
+
+*Bug Fixes*
+- Re-enable support for YAML aliases when using YAML.safe_load [#510](https://github.com/Shopify/kubernetes-deploy/pull/510)
+
+## 0.26.5
+
+*Bug Fixes*
+- Support 'volumeBindingMode: WaitForFirstConsumer' condition in StorageClass. [#479](https://github.com/Shopify/kubernetes-deploy/pull/479)
+- Fix: Undefined method "merge" on LabelSelector. [#488](https://github.com/Shopify/kubernetes-deploy/pull/488)
+
+*Enhancements*
+- Officially support Kubernetes 1.14. [#461](https://github.com/Shopify/kubernetes-deploy/pull/461)
+- Allow customising which custom resources are deployed in the pre-deploy phase. [#505](https://github.com/Shopify/kubernetes-deploy/pull/505)
+
+*Other*
+- Removes special treatment of GCP authentication by upgrading to `kubeclient` 4.3. [#465](https://github.com/Shopify/kubernetes-deploy/pull/465)
+
+## 0.26.4
+
+*Bug fixes*
+- Adds several additional safeguards against the content of Secret resources being logged. [#474](https://github.com/Shopify/kubernetes-deploy/pull/474)
+
+*Enhancements*
+- Improves scalability by removing a check that caused recoverable registry problems to fail deploys. [#477](https://github.com/Shopify/kubernetes-deploy/pull/477)
+
+*Other*
+- Relaxes our dependency on the OJ gem. [#471](https://github.com/Shopify/kubernetes-deploy/pull/471)
+
+## 0.26.3
+
+*Bug fixes*
+- Fixes a bug introduced in 0.26.0 where listing multiple files in the $KUBECONFIG environment variable would throw an error ([#468](https://github.com/Shopify/kubernetes-deploy/pull/468))
+- Fixes a bug introduced in 0.26.2 where kubernetes-render started adding YAML headers to empty render results ([#467](https://github.com/Shopify/kubernetes-deploy/pull/467))
+
+## 0.26.2
+
+*Enhancements*
+- kubernetes-render outputs results of rendering yml.erb files without passing them
+through a yaml parser. ([#454](https://github.com/Shopify/kubernetes-deploy/pull/454))
+
+*Bug fixes*
+- Remove use of deprecated feature preventing use with Kubernetes 1.14 ([#460](https://github.com/Shopify/kubernetes-deploy/pull/460))
+
+## 0.26.1
+
+*Bug fixes*
+- Fixes a bug where `config/deploy/$ENVIRONMENT` would be used unconditionally if the `ENVIRONMENT` environment variable is set, ignoring any `--template-dir` argument passed.
+
+## 0.26.0
+
+*Enhancements*
+- Add support for NetworkPolicies ([#422](https://github.com/Shopify/kubernetes-deploy/pull/422))
+- Setting the REVISION environment variable is now optional ([#429](https://github.com/Shopify/kubernetes-deploy/pull/429))
+- Defaults KUBECONFIG to `~/.kube/config` ([#429](https://github.com/Shopify/kubernetes-deploy/pull/429))
+- Uses `TASK_ID` environment variable as the `deployment_id` when rendering resource templates for better [Shipit](https://github.com/Shopify/shipit) integration. ([#430](https://github.com/Shopify/kubernetes-deploy/pull/430))
+- Arguments to `--bindings` will now be deep merged. ([#419](https://github.com/Shopify/kubernetes-deploy/pull/419))
+- `kubernetes-deploy` and `kubernetes-render` now support reading templates from STDIN. ([#415](https://github.com/Shopify/kubernetes-deploy/pull/415))
+- Support for specifying a `--selector`, a label with which all deployed resources are expected to have, and by which prunable resources will be filtered. This permits sharing a namespace with resources managed by third-parties, including other kubernetes-deploy deployments. ([#439](https://github.com/Shopify/kubernetes-deploy/pull/439))
+- Lists of resources printed during deployments will now be sorted alphabetically. ([#441](https://github.com/Shopify/kubernetes-deploy/pull/441))
+- Bare / unmanaged pods run as pre-deployment tasks will now stream logs if there is only one of them. ([#436](https://github.com/Shopify/kubernetes-deploy/pull/436))
+
+*Features*
+
+- **[Breaking change]** Support for deploying Secrets from templates ([#424](https://github.com/Shopify/kubernetes-deploy/pull/424)). Non-ejson secrets are now fully supported and therefore **subject to pruning like any other resource**. As a result:
+  * If you previously manually `kubectl apply`'d secrets that are not passed to kubernetes-deploy, your first deploy using this version is going to delete them.
+  * If you previously passed secrets manifests to kubernetes-deploy and they are no longer in the set you pass to the first deploy using this version, it will delete them.
+  * To identify potentially affected secrets in your cluster, run: `kubectl get secrets -o jsonpath='{ range .items[*] }{.metadata.namespace}{ "\t" }{.metadata.name}{ "\t" }{.metadata.annotations}{ "\n" }{ end }' --context=$YOUR_CONTEXT_HERE --all-namespaces | grep -v "kubernetes-deploy.shopify.io/ejson-secret" | grep "last-applied" | cut -f 1,2`. To exclude a secret from kubernetes-deploy (and kubectl apply) management, remove the last-applied annotation `kubectl annotate secret $SECRET_NAME kubectl.kubernetes.io/last-applied-configuration-`.
+  * The secret `ejson-keys` will never be pruned by kubernetes-deploy. Instead, it will fail the deploy at the validation stage (unless `--no-prune` is set). ([#447](https://github.com/Shopify/kubernetes-deploy/pull/447))
+
+## 0.25.0
+
+#### WARNING
+This version contains an error for handling the `--template-dir` argument. If the `ENVIRONMENT` environment variable is set, the template directory will be forcefully set to `config/deploy/$ENVIRONMENT`. This has been fixed in version 0.26.1
+
+*Features*
+- Support timeout overrides on deployments ([#414](https://github.com/Shopify/kubernetes-deploy/pull/414))
+
+*Bug fixes*
+- Attempting to deploy from a directory that only contains `secrets.ejson` will no longer fail deploy ([#416](https://github.com/Shopify/kubernetes-deploy/pull/416))
+- Remove the risk of sending decrypted EJSON secrets to output([#431](https://github.com/Shopify/kubernetes-deploy/pull/431))
+
+*Other*
+- Update kubeclient gem to 4.2.2. Note this replaces the `KubeclientBuilder::GoogleFriendlyConfig` class with `KubeclientBuilder::KubeConfig` ([#418](https://github.com/Shopify/kubernetes-deploy/pull/418)). This resolves [#396](https://github.com/Shopify/kubernetes-deploy/issues/396) and should allow us to support more authentication methods (e.g. `exec` for EKS).
+- Invalid context when using `kubernetes-run` gives more descriptive error([#423](https://github.com/Shopify/kubernetes-deploy/pull/423))
+- When resources are not found, instead of being `Unknown`, they are now labelled as `Not Found`([#427](https://github.com/Shopify/kubernetes-deploy/pull/427))
+
+## 0.24.0
+
+*Features*
+- Add support for specifying pass/fail conditions of Custom Resources ([#376](https://github.com/Shopify/kubernetes-deploy/pull/376)).
+- Add support for custom timeouts for Custom Resources([#376](https://github.com/Shopify/kubernetes-deploy/pull/376))
+
+*Enhancements*
+- Officially support Kubernetes 1.13 ([#409](https://github.com/Shopify/kubernetes-deploy/pull/409))
+
+*Bug fixes*
+- Fixed bug that caused `NameError: wrong constant name` if custom resources had kind with a lowercase first letter. ([#413](https://github.com/Shopify/kubernetes-deploy/pull/413))
+
+*Other*
+- Kubernetes 1.9 is no longer officially supported as of this version
+
+## 0.23.0
+
+*Features*
+- New command: `kubernetes-render` is a tool for rendering ERB templates to raw Kubernetes YAML. It's useful for seeing what `kubernetes-deploy` does before actually invoking `kubectl` on the rendered YAML. It's also useful for outputting YAML that can be passed to other tools, for validation or introspection purposes. ([#375](https://github.com/Shopify/kubernetes-deploy/pull/375/files))
+- **[Breaking change]** This release completes the conversion of `kubernetes-deploy` StatsD metrics to `distribution`s, which was done for `kubernetes-restart` and `kubernetes-run` in v0.22.0.
+- Several new distribution metrics are available to give insight into the timing of each step of the deploy process: `KubernetesDeploy.validate_configuration.duration`, `KubernetesDeploy.discover_resources.duration`, `KubernetesDeploy.validate_resources.duration`, `KubernetesDeploy.initial_status.duration`, `KubernetesDeploy.create_ejson_secrets.duration`, `KubernetesDeploy.apply_all.duration`, `KubernetesDeploy.sync.duration`
+- **[Breaking change]** `KubernetesDeploy.resource.duration` no longer includes `sha` or `resource` tags. ([#392](https://github.com/Shopify/kubernetes-deploy/pull/392))
+
+*Enhancements*
+- Roles are now predeployed before RoleBindings ([#380](https://github.com/Shopify/kubernetes-deploy/pull/380))
+- Several performance enhancements for deploys to namespaces with hundreds of resources.
+- KubernetesDeploy no longer modifies the global StatsD configuration when used as a gem ([#384](https://github.com/Shopify/kubernetes-deploy/pull/384))
+
+*Bug fixes*
+- Handle out-of-order arrival of entries from different streams when processing logs ([#401](https://github.com/Shopify/kubernetes-deploy/pull/401))
+
 ## 0.22.0
 
 *Features*

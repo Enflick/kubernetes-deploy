@@ -1,19 +1,24 @@
 # frozen_string_literal: true
 require 'tempfile'
 
+require 'kubernetes-deploy/common'
 require 'kubernetes-deploy/kubeclient_builder'
 require 'kubernetes-deploy/kubectl'
+require 'kubernetes-deploy/resource_cache'
+require 'kubernetes-deploy/resource_watcher'
+require 'kubernetes-deploy/kubernetes_resource'
+require 'kubernetes-deploy/kubernetes_resource/pod'
+require 'kubernetes-deploy/runner_task_config_validator'
 
 module KubernetesDeploy
   class RunnerTask
-    include KubeclientBuilder
-
     class TaskTemplateMissingError < TaskConfigurationError; end
 
     attr_reader :pod_name
 
-    def initialize(namespace:, context:, logger:, max_watch_seconds: nil)
-      @logger = logger
+    def initialize(namespace:, context:, logger: nil, max_watch_seconds: nil)
+      @logger = logger || KubernetesDeploy::FormattedLogger.build(namespace, context)
+      @task_config = KubernetesDeploy::TaskConfig.new(context, namespace, @logger)
       @namespace = namespace
       @context = context
       @max_watch_seconds = max_watch_seconds
@@ -31,7 +36,11 @@ module KubernetesDeploy
       @logger.reset
 
       @logger.phase_heading("Initializing task")
-      validate_configuration(task_template, args)
+
+      @logger.info("Validating configuration")
+      verify_config!(task_template, args)
+      @logger.info("Using namespace '#{@namespace}' in context '#{@context}'")
+
       pod = build_pod(task_template, entrypoint, args, env_vars, verify_result)
       validate_pod(pod)
 
@@ -59,12 +68,12 @@ module KubernetesDeploy
     private
 
     def create_pod(pod)
-      @logger.info "Creating pod '#{pod.name}'"
+      @logger.info("Creating pod '#{pod.name}'")
       pod.deploy_started_at = Time.now.utc
       kubeclient.create_pod(pod.to_kubeclient_resource)
       @pod_name = pod.name
       @logger.info("Pod creation succeeded")
-    rescue KubeException => e
+    rescue Kubeclient::HttpError => e
       msg = "Failed to create pod: #{e.class.name}: #{e.message}"
       @logger.summary.add_paragraph(msg)
       raise FatalDeploymentError, msg
@@ -103,53 +112,25 @@ module KubernetesDeploy
       @logger.summary.add_paragraph(warning)
     end
 
-    def validate_configuration(task_template, args)
-      @logger.info("Validating configuration")
-      errors = []
-
-      if task_template.blank?
-        errors << "Task template name can't be nil"
-      end
-
-      if @namespace.blank?
-        errors << "Namespace can't be empty"
-      end
-
-      if args.blank?
-        errors << "Args can't be nil"
-      end
-
-      begin
-        kubeclient.get_namespace(@namespace) if @namespace.present?
-        @logger.info "Using namespace '#{@namespace}' in context '#{@context}'"
-      rescue KubeException => e
-        msg = e.error_code == 404 ? "Namespace was not found" : "Could not connect to kubernetes cluster"
-        errors << msg
-      end
-
-      unless errors.empty?
+    def verify_config!(task_template, args)
+      task_config_validator = RunnerTaskConfigValidator.new(task_template, args, @task_config, kubectl,
+        kubeclient_builder)
+      unless task_config_validator.valid?
         @logger.summary.add_action("Configuration invalid")
-        @logger.summary.add_paragraph(errors.map { |err| "- #{err}" }.join("\n"))
-        raise TaskConfigurationError, "Configuration invalid: #{errors.join(', ')}"
-      end
-
-      if kubectl.server_version < Gem::Version.new(MIN_KUBE_VERSION)
-        @logger.warn(KubernetesDeploy::Errors.server_version_warning(kubectl.server_version))
+        @logger.summary.add_paragraph([task_config_validator.errors].map { |err| "- #{err}" }.join("\n"))
+        raise KubernetesDeploy::TaskConfigurationError
       end
     end
 
     def get_template(template_name)
       pod_template = kubeclient.get_pod_template(template_name, @namespace)
-
       pod_template.template
-    rescue KubeException => error
-      if error.error_code == 404
-        msg = "Pod template `#{template_name}` not found in namespace `#{@namespace}`, context `#{@context}`"
-        @logger.summary.add_paragraph(msg)
-        raise TaskTemplateMissingError, msg
-      else
-        raise FatalKubeAPIError, "Error retrieving pod template: #{error.class.name}: #{error.message}"
-      end
+    rescue Kubeclient::ResourceNotFoundError
+      msg = "Pod template `#{template_name}` not found in namespace `#{@namespace}`, context `#{@context}`"
+      @logger.summary.add_paragraph(msg)
+      raise TaskTemplateMissingError, msg
+    rescue Kubeclient::HttpError => error
+      raise FatalKubeAPIError, "Error retrieving pod template: #{error.class.name}: #{error.message}"
     end
 
     def build_pod_definition(base_template)
@@ -198,7 +179,11 @@ module KubernetesDeploy
     end
 
     def kubeclient
-      @kubeclient ||= build_v1_kubeclient(@context)
+      @kubeclient ||= kubeclient_builder.build_v1_kubeclient(@context)
+    end
+
+    def kubeclient_builder
+      @kubeclient_builder ||= KubeclientBuilder.new
     end
 
     def statsd_tags(status)

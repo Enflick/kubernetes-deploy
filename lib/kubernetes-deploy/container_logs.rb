@@ -13,12 +13,13 @@ module KubernetesDeploy
       @logger = logger
       @lines = []
       @next_print_index = 0
+      @printed_latest = false
     end
 
     def sync
       new_logs = fetch_latest
       return unless new_logs.present?
-      @lines += deduplicate(new_logs)
+      @lines += sort_and_deduplicate(new_logs)
     end
 
     def empty?
@@ -29,14 +30,19 @@ module KubernetesDeploy
       prefix_str = "[#{container_name}]  " if prefix
 
       lines[@next_print_index..-1].each do |msg|
-        @logger.info "#{prefix_str}#{msg}"
+        @logger.info("#{prefix_str}#{msg}")
       end
 
       @next_print_index = lines.length
+      @printed_latest = true
     end
 
     def print_all
       lines.each { |line| @logger.info("\t#{line}") }
+    end
+
+    def printing_started?
+      @printed_latest
     end
 
     private
@@ -60,18 +66,24 @@ module KubernetesDeploy
       time.strftime("%FT%T.%N%:z")
     end
 
-    def deduplicate(logs)
-      deduped = []
-      check_for_duplicate = true
+    def sort_and_deduplicate(logs)
+      parsed_lines = logs.map { |line| split_timestamped_line(line) }
+      sorted_lines = parsed_lines.sort do |(timestamp1, _msg1), (timestamp2, _msg2)|
+        if timestamp1.nil?
+          -1
+        elsif timestamp2.nil?
+          1
+        else
+          timestamp1 <=> timestamp2
+        end
+      end
 
-      logs.each do |line|
-        timestamp, msg = split_timestamped_line(line)
-        next if check_for_duplicate && likely_duplicate?(timestamp)
-        check_for_duplicate = false # logs are ordered, so once we've seen a new one, assume all subsequent logs are new
+      deduped = []
+      sorted_lines.each do |timestamp, msg|
+        next if likely_duplicate?(timestamp)
         @last_timestamp = timestamp if timestamp
         deduped << msg
       end
-
       deduped
     end
 
