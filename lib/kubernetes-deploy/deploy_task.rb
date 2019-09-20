@@ -494,11 +494,11 @@ module KubernetesDeploy
         end
       end
 
-      if unidentified_errors.present? && filenames_with_sensitive_content.any?
-        warn_msg = "WARNING: There was an error applying some or all resources. The raw output may be sensitive and " \
-          "so cannot be displayed."
-        @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
-      elsif unidentified_errors.present?
+      # if unidentified_errors.present? && filenames_with_sensitive_content.any?
+      #   warn_msg = "WARNING: There was an error applying some or all resources. The raw output may be sensitive and " \
+      #     "so cannot be displayed."
+      #   @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
+      if unidentified_errors.present?
         heading = ColorizedString.new('Unidentified error(s):').red
         msg = FormattedLogger.indent_four(unidentified_errors.join)
         @logger.summary.add_paragraph("#{heading}\n#{msg}")
