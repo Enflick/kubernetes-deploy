@@ -127,6 +127,7 @@ module KubernetesDeploy
     end
     alias_method :assert_restart_success, :assert_deploy_success
     alias_method :assert_task_run_success, :assert_deploy_success
+    alias_method :assert_diff_success, :assert_deploy_success
 
     def assert_logs_match(regexp, times = nil)
       logging_assertion do |logs|
@@ -187,6 +188,14 @@ module KubernetesDeploy
       source_dir
     end
 
+    def fixture_files_path(set_name, files: [])
+      fixtures = []
+      files.each do |file|
+        fixtures << fixture_path(set_name) + "/" + file
+      end
+      fixtures
+    end
+
     def stub_kubectl_response(*args, kwargs: {}, resp:, err: "", success: true, json: true, times: 1)
       if json
         kwargs[:output] = "json"
@@ -239,14 +248,6 @@ module KubernetesDeploy
         $stderr.puts("\033[0;33mWARNING: Skipping logging assertions while logs are redirected to stderr\033[0m")
       else
         yield @logger_stream.string
-      end
-    end
-
-    def stdout_assertion
-      if log_to_real_fds?
-        $stderr.puts("\033[0;33mWARNING: Skipping stream assertions while logs are redirected to stderr\033[0m")
-      else
-        yield @mock_output_stream.string
       end
     end
 
