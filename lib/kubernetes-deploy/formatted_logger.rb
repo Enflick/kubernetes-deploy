@@ -27,7 +27,11 @@ module KubernetesDeploy
       end
 
       l.formatter = proc do |severity, datetime, _progname, msg|
-        colorized_line = ColorizedString.new("[#{severity}][#{datetime}]#{middle}\t#{msg}\n")
+        if ENV["DISABLE_TIMESTAMPS"].present?
+          colorized_line = ColorizedString.new("   #{msg}\n")
+        else 
+          colorized_line = ColorizedString.new("[#{severity}][#{datetime}]#{middle}\t#{msg}\n")
+        end
 
         case severity
         when "FATAL"
