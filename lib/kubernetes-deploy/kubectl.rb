@@ -52,7 +52,7 @@ module KubernetesDeploy
           @logger.warn("#{warning}: #{Shellwords.join(cmd)}")
           @logger.warn(err) unless output_is_sensitive
         else
-          @logger.debug("Kubectl err: #{output_is_sensitive ? '<suppressed sensitive output>' : err}")
+          @logger.debug("Kubectl err: #{output_is_sensitive ? '<suppressed sensitive output>' : err}, status: #{st}")
         end
         StatsD.increment('kubectl.error', 1, tags: { context: @context, namespace: @namespace, cmd: cmd[1] })
 
