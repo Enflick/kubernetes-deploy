@@ -35,7 +35,11 @@ module KubernetesDeploy
 
         case severity
         when "FATAL"
-          ColorizedString.new("[#{severity}][#{datetime}]#{middle}\t").red + "#{msg}\n"
+          if ENV["DISABLE_TIMESTAMPS"].present?
+            colorized_line = ColorizedString.new("   #{msg}\n")
+          else 
+            ColorizedString.new("[#{severity}][#{datetime}]#{middle}\t").red + "#{msg}\n"
+          end
         when "ERROR"
           colorized_line.red
         when "WARN"
@@ -44,6 +48,7 @@ module KubernetesDeploy
           colorized_line
         end
       end
+      
       l
     end
 
