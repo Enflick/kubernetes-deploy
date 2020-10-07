@@ -464,7 +464,7 @@ module KubernetesDeploy
     end
 
     def validate_spec_with_kubectl(kubectl)
-      command = ["create", "-f", file_path, "--dry-run", "--output=name"]
+      command = ["create", "-f", file_path, "--dry-run=client", "--output=name"]
       _, err, st = kubectl.run(*command, log_failure: false, output_is_sensitive: sensitive_template_content?,
         retry_whitelist: [:client_timeout], attempts: 3)
 
