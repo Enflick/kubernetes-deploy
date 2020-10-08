@@ -298,20 +298,30 @@ module KubernetesDeploy
         run_string = ColorizedString.new("Running diff on #{r.type} #{r.namespace}.#{r.name}:").green
         @logger.blank_line
         @logger.info(run_string)
-        output, err, diff_st = kubectl.run("diff", "-f", r.file_path, log_failure: true, fail_expected: true)
 
+        output, err, diff_st = kubectl.run("diff", "-f", r.file_path, log_failure: true, fail_expected: true)
 
         if output.blank?
           no_diff_string = ColorizedString.new("Local and cluster versions are identical").yellow
           @logger.info(no_diff_string)
         end
 
-        # Kubectl DIFF currently spits out exit code 1 in all cases - PR to customize that is open
-        # https://github.com/kubernetes/kubernetes/pull/82336
-        if diff_st.success? || err == "exit status 1"
-          stream.puts output
-          next
+        if (Gem::Version.new(kubectl.client_version) > Gem::Version.new("1.18.0"))
+          # from kubectt 1.18.0, the diff command now returns -1 (not a success)
+          if diff_st.exitstatus == 1 || diff_st.exitstatus == 0
+            stream.puts output
+            next
+          end
+        else
+          # versions lower than 1.18
+          # Kubectl DIFF currently spits out exit code 1 in all cases - PR to customize that is open
+          # https://github.com/kubernetes/kubernetes/pull/82336
+          if diff_st.success? || err == "exit status 1"
+            stream.puts output
+            next
+          end
         end
+
         raise FatalDeploymentError, <<~MSG
           Failed to diff resource: #{r.id}
           #{err}
